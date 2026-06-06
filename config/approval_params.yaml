@@ -1,0 +1,4 @@
+approval_node:
+  ros__parameters:
+    decision_timeout_sec: 0.0
+    auto_approve_on_timeout: false

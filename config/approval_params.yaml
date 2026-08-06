@@ -1,4 +1,17 @@
 approval_node:
   ros__parameters:
-    decision_timeout_sec: 0.0
-    auto_approve_on_timeout: false
+    # HTTP + WebSocket server the ground station connects to. 0.0.0.0 so any host
+    # on the Herelink WiFi can reach it.
+    ws_host: '0.0.0.0'
+    ws_port: 8765
+
+    # Rate at which drone position is pushed to connected browsers. MAVROS publishes
+    # far faster than a constrained radio link should carry.
+    gps_broadcast_hz: 1.0
+
+    # How many recent annotated crops to keep in memory for GET /frame/<id>.
+    frame_cache_size: 8
+
+# NOTE: the approval timeout is deliberately NOT configured here. mission_node owns
+# it (Approval_timeout_sec in bv_core/config/mission_params.yaml) so the aircraft
+# still recovers if this process or the radio link dies.

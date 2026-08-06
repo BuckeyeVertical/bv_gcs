@@ -1,24 +1,24 @@
 import { create } from 'zustand';
-import type { PendingDetection } from '../ros/types';
-
-interface DroneFix {
-  latitude: number;
-  longitude: number;
-}
+import type { DroneFix, PendingDetection } from '../net/types';
 
 interface GcsState {
   connected: boolean;
   missionState: string | null;
   droneFix: DroneFix | null;
   activePending: PendingDetection | null;
+  /**
+   * Wall-clock ms when mission_node will auto-approve, or null when there is no
+   * deadline. Derived once from timeout_sec - age_sec so the countdown never
+   * depends on the drone and this laptop agreeing on the time.
+   */
+  pendingDeadline: number | null;
   inFlightDecisionId: string | null;
   lastMessage: string | null;
 
   setConnected: (v: boolean) => void;
-  setMissionState: (s: string) => void;
-  setDroneFix: (fix: DroneFix) => void;
-  setActivePending: (p: PendingDetection) => void;
-  clearActivePending: () => void;
+  setMissionState: (s: string | null) => void;
+  setDroneFix: (fix: DroneFix | null) => void;
+  setActivePending: (p: PendingDetection | null) => void;
   setInFlightDecisionId: (id: string | null) => void;
   setLastMessage: (m: string | null) => void;
 }
@@ -28,15 +28,22 @@ export const useGcsStore = create<GcsState>((set) => ({
   missionState: null,
   droneFix: null,
   activePending: null,
+  pendingDeadline: null,
   inFlightDecisionId: null,
   lastMessage: null,
 
   setConnected: (v) => set({ connected: v }),
   setMissionState: (s) => set({ missionState: s }),
   setDroneFix: (fix) => set({ droneFix: fix }),
-  setActivePending: (p) => set({ activePending: p }),
-  clearActivePending: () =>
-    set({ activePending: null, inFlightDecisionId: null }),
+  setActivePending: (p) =>
+    set({
+      activePending: p,
+      pendingDeadline:
+        p && p.timeout_sec > 0
+          ? Date.now() + Math.max(0, p.timeout_sec - p.age_sec) * 1000
+          : null,
+      inFlightDecisionId: null,
+    }),
   setInFlightDecisionId: (id) => set({ inFlightDecisionId: id }),
   setLastMessage: (m) => set({ lastMessage: m }),
 }));

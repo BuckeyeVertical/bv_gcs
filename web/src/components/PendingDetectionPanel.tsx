@@ -1,8 +1,13 @@
 import { useGcsStore } from '../store/useGcsStore';
-import { className } from '../ros/types';
 import { bearingDeg, haversineMeters } from '../lib/geo';
+import { ApprovalCountdown } from './ApprovalCountdown';
 import { DecisionButtons } from './DecisionButtons';
 
+/**
+ * Detail strip beneath the image: what was detected, where, and the approve/reject
+ * controls. The coordinates are a sanity check (is this localized somewhere absurd?),
+ * not the primary evidence — that's the image.
+ */
 export function PendingDetectionPanel() {
   const active = useGcsStore((s) => s.activePending);
   const fix = useGcsStore((s) => s.droneFix);
@@ -11,14 +16,11 @@ export function PendingDetectionPanel() {
   if (!active) {
     return (
       <section className="border border-bg-border bg-bg-panel p-4">
-        <header className="text-[10px] font-mono uppercase tracking-[0.2em] text-ink-dim">
-          Pending Detection
-        </header>
-        <div className="mt-6 text-center text-ink-dim font-mono text-xs">
-          NO ACTIVE DETECTION
+        <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-ink-dim">
+          Awaiting detection
         </div>
         {message && (
-          <div className="mt-4 text-[10px] font-mono text-ink-muted">
+          <div className="mt-2 font-mono text-[10px] text-ink-muted">
             last: {message}
           </div>
         )}
@@ -26,55 +28,52 @@ export function PendingDetectionPanel() {
     );
   }
 
-  const baselat = fix?.latitude ?? active.drone_latitude;
-  const baselon = fix?.longitude ?? active.drone_longitude;
+  const baseLat = fix?.latitude ?? active.drone_latitude;
+  const baseLon = fix?.longitude ?? active.drone_longitude;
   const distance = haversineMeters(
-    baselat,
-    baselon,
+    baseLat,
+    baseLon,
     active.latitude,
     active.longitude,
   );
-  const bearing = bearingDeg(
-    baselat,
-    baselon,
-    active.latitude,
-    active.longitude,
-  );
+  const bearing = bearingDeg(baseLat, baseLon, active.latitude, active.longitude);
 
   return (
-    <section className="border border-accent-amber/60 bg-bg-panel p-4 space-y-4">
-      <header className="flex items-center justify-between">
-        <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-accent-amber">
-          ▲ Pending Detection
-        </div>
-        <span className="font-mono text-[10px] text-ink-dim">
-          {active.detection_id.slice(0, 8)}
-        </span>
-      </header>
+    <section className="border border-accent-amber/60 bg-bg-panel p-4">
+      <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-6">
+        <div className="min-w-0 space-y-3">
+          <div className="flex items-baseline gap-3">
+            <span className="text-2xl font-bold uppercase tracking-wider text-ink-primary">
+              {active.class_name}
+            </span>
+            <span className="font-mono text-xs text-accent-amber">
+              {(active.confidence * 100).toFixed(0)}%
+            </span>
+            <span className="font-mono text-[10px] text-ink-dim">
+              {active.detection_id.slice(0, 8)}
+            </span>
+          </div>
 
-      <div>
-        <div className="text-[10px] font-mono uppercase text-ink-dim">Class</div>
-        <div className="text-2xl font-bold uppercase tracking-wider text-ink-primary">
-          {className(active.class_id)}
+          <div className="grid grid-cols-3 gap-x-6 gap-y-2 font-mono text-xs sm:grid-cols-5">
+            <Field label="Lat" value={active.latitude.toFixed(6)} />
+            <Field label="Lon" value={active.longitude.toFixed(6)} />
+            <Field label="Alt" value={`${active.altitude.toFixed(1)} m`} />
+            <Field label="Dist" value={`${distance.toFixed(1)} m`} />
+            <Field label="Bearing" value={`${bearing.toFixed(0)}°`} />
+          </div>
+
+          {message && (
+            <div className="border-t border-bg-border pt-2 font-mono text-[10px] text-ink-muted">
+              {message}
+            </div>
+          )}
+        </div>
+
+        <div className="w-64 space-y-3">
+          <ApprovalCountdown />
+          <DecisionButtons />
         </div>
       </div>
-
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 font-mono text-xs">
-        <Field label="Lat" value={active.latitude.toFixed(6)} />
-        <Field label="Lon" value={active.longitude.toFixed(6)} />
-        <Field label="Alt" value={`${active.altitude.toFixed(1)} m`} />
-        <Field label="Conf" value={active.confidence.toFixed(2)} />
-        <Field label="Dist" value={`${distance.toFixed(1)} m`} />
-        <Field label="Bearing" value={`${bearing.toFixed(0)}°`} />
-      </div>
-
-      <DecisionButtons />
-
-      {message && (
-        <div className="text-[10px] font-mono text-ink-muted border-t border-bg-border pt-2">
-          {message}
-        </div>
-      )}
     </section>
   );
 }

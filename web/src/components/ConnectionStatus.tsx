@@ -1,21 +1,23 @@
 import clsx from 'clsx';
+import { WS_URL } from '../net/client';
 import { useGcsStore } from '../store/useGcsStore';
 
 export function ConnectionStatus() {
   const connected = useGcsStore((s) => s.connected);
-  const url = (import.meta.env.VITE_ROS_URL as string) ?? 'ws://localhost:9090';
   return (
-    <div className="flex items-center gap-2 text-xs font-mono">
+    <div className="flex items-center gap-2 font-mono text-xs">
       <span
         className={clsx(
           'h-2 w-2 rounded-full',
-          connected ? 'bg-accent-green shadow-[0_0_8px_#3fb950]' : 'bg-accent-red',
+          connected
+            ? 'bg-accent-green shadow-[0_0_8px_#3fb950]'
+            : 'bg-accent-red animate-pulse',
         )}
       />
-      <span className="text-ink-muted">
-        {connected ? 'ROSBRIDGE' : 'DISCONNECTED'}
+      <span className={connected ? 'text-ink-muted' : 'text-accent-red'}>
+        {connected ? 'GCS LINK' : 'DISCONNECTED'}
       </span>
-      <span className="text-ink-dim">{url}</span>
+      <span className="text-ink-dim">{WS_URL}</span>
     </div>
   );
 }

@@ -2,209 +2,153 @@
 
 Human-in-the-loop ground control station for the [bv_core](https://github.com/BuckeyeVertical/bv_core) drone stack.
 
-When the drone is running autonomously, every confirmed detection flows straight into the mission FSM and the drone immediately localizes, flies to the object, and deploys a payload. `bv_gcs` inserts a human approval gate into that flow: each confirmed detection pops up in a browser dashboard showing its class and geolocated lat/lon on a dark map, and the operator must click **APPROVE** (or **REJECT**) before the drone acts on it.
+Flying autonomously, every confirmed detection goes straight into the mission FSM: the
+drone localizes the object, flies to it, and drops a payload. `bv_gcs` inserts an
+operator gate into that flow. After the drone has localized a detection — and while it
+holds in `AUTO.LOITER` — an **annotated crop of the frame that produced the fix** appears
+in a browser dashboard, and the operator approves or rejects before the drone acts.
 
-The package ships two pieces:
+The operator judges from the image. Coordinates are shown as a sanity check, not as the
+primary evidence.
 
 | Component | Path | Runs on | Role |
 | --- | --- | --- | --- |
-| `approval_node` (ROS 2 Python) | `bv_gcs/approval_node.py` | drone companion computer | Holds pending detections and gates the FSM. |
-| Web frontend (Vite + React + TS) | `web/` | ground laptop browser | Palantir-style dark UI + map + Approve/Reject. |
+| `approval_node` | `bv_gcs/approval_node.py` | drone companion computer | Relays pendings to the browser and verdicts back to `mission_node`. Also serves the frontend. |
+| Web frontend | `web/` | ground laptop browser | Dark image-first UI with Approve/Reject. |
 
 ## Architecture
 
 ```
-[ Browser on ground laptop :5173 ]
-                 |  WebSocket via roslibjs
-                 v
-[ Drone companion computer ]    rosbridge_websocket :9090
-                                         |
-filtering_node --/pending_obj_dets--> approval_node --/approved_obj_dets--> mission_node
-                                         ^   |
-                       srv /detection_decision  /pending_obj_dets_active (latched)
+    mission_node --/pending_obj_dets--> approval_node <--WebSocket JSON--> browser
+          ^                                    |
+          └────── srv /detection_decision ─────┘
 ```
 
-Only `rosbridge_websocket` (~100–160 MB RSS) and the small `approval_node` (~20–40 MB RSS) run on the drone. Everything else — the React app, the map tiles, the keyboard shortcuts — runs in the browser on the ground laptop. Net onboard overhead is **~120–200 MB**.
+`approval_node` is a **relay, not an authority**. `mission_node` assigns detection IDs,
+owns the approval timeout, and decides what the aircraft does. If this node crashes or
+the radio link drops, `mission_node` still times out on its own and continues the
+mission. Nothing here is safety-critical.
 
-When the gate is disabled (`human_approval_required:=false`), neither `approval_node` nor `rosbridge_websocket` is launched; `mission_node` subscribes directly to `/global_obj_dets` and the original autonomous behavior is preserved bit-for-bit.
+Only `approval_node` (~40 MB RSS) runs on the drone — there is no rosbridge, no Node.js,
+and no npm on the aircraft. It speaks plain JSON over an `aiohttp` WebSocket.
 
-## Topic / service contract
+When the gate is disabled (`human_approval_required:=false`), `mission_node` never
+publishes a pending and the original autonomous behavior is preserved exactly.
 
-| Direction | Name | Type | QoS | Purpose |
-| --- | --- | --- | --- | --- |
-| filtering → approval | `/pending_obj_dets` | `bv_msgs/PendingDetection` | RELIABLE | New confirmed detection with coarse lat/lon. |
-| approval → GCS | `/pending_obj_dets_active` | `bv_msgs/PendingDetection` | RELIABLE, TRANSIENT_LOCAL, depth 1 | Latched current pending; late-joining browsers see it. Empty `detection_id` means no pending. |
-| approval → mission | `/approved_obj_dets` | `std_msgs/Int8` | RELIABLE | Class ID — only published after APPROVE. |
-| GCS → approval | `/detection_decision` | `bv_msgs/DetectionDecision` | service | Operator's decision. Response `accepted=false` if the `detection_id` is stale. |
+### Why images go over HTTP
 
-`approval_node` parameters (see `config/approval_params.yaml`):
+The annotated crop is fetched with `GET /frame/<detection_id>`, not embedded as base64
+in the WebSocket frame. On a constrained radio link that keeps the control channel
+responsive, avoids base64's 1.33x overhead, and lets a failed image retry on its own
+without disturbing the decision path.
 
-| Parameter | Type | Default | Purpose |
+### Why the crop is not a whole frame
+
+The camera is 4640 px wide. Downscaling a full frame small enough to send over the link
+renders a person roughly 10–15 px tall — too small for a human to judge, which defeats
+the point of asking one. `vision_node` sends a native-resolution crop around the
+bounding box instead: smaller payload *and* a legible target.
+
+## Contract
+
+| Direction | Name | Type | Purpose |
 | --- | --- | --- | --- |
-| `decision_timeout_sec` | double | `0.0` | If `> 0`, auto-resolve after this many seconds with no operator input. `0` = wait forever. |
-| `auto_approve_on_timeout` | bool | `false` | When the timer fires, approve (`true`) or reject (`false`). |
+| mission → approval | `/pending_obj_dets` | `bv_msgs/PendingDetection` | Localized detection + annotated crop. Empty `detection_id` means "cleared". |
+| approval → mission | `/detection_decision` | `bv_msgs/DetectionDecision` (service) | Operator verdict. `accepted=false` if the ID is stale. |
+| mission → all | `/mission_state` | `std_msgs/String` | Displayed in the sidebar. |
+| MAVROS → approval | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | Drone position, throttled before broadcast. |
 
-## Dependencies
+`approval_node` parameters (`config/approval_params.yaml`):
 
-- ROS 2 Humble.
-- `bv_msgs` with the two new interfaces added (see *Add new bv_msgs interfaces* below).
-- `ros-humble-rosbridge-suite` on the drone (also added to `bv_core/container/Dockerfile.{arm,x86}`).
-- Node.js 20+ on the ground laptop (for the web frontend; not on the drone).
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `ws_host` | `0.0.0.0` | Bind address, so any host on the Herelink WiFi can reach it. |
+| `ws_port` | `8765` | HTTP + WebSocket port. |
+| `gps_broadcast_hz` | `1.0` | Rate limit for drone position pushes. |
+| `frame_cache_size` | `8` | Recent crops kept in memory for `GET /frame/<id>`. |
 
-## One-time setup
+**The approval timeout is deliberately not configured here.** It lives in
+`bv_core/config/mission_params.yaml` as `Approval_timeout_sec` (default 180 s), because
+a timer inside the process that might crash is not a safety net. It **fails open** — on
+expiry the drone deploys and continues, which is exactly what it does with no gate at
+all. `approval_node` forwards the value so the UI can show a countdown, and never acts
+on it.
 
-### 1. Add the new bv_msgs interfaces
+## HTTP endpoints
 
-`bv_gcs` adds two new ROS interfaces. They live in your existing [bv_msgs](https://github.com/BuckeyeVertical/bv_msgs) repo. Copy them in:
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /` | The dashboard (or a placeholder if `web/dist` isn't built). |
+| `GET /ws` | WebSocket, 20 s heartbeat so a dead link is detected. |
+| `GET /frame/<detection_id>` | Annotated crop, JPEG. |
+| `GET /healthz` | Client count, active pending, frontend path. Handy over SSH. |
 
-```bash
-# From a checkout of this repo:
-cp -r /path/to/bv_gcs_msgs_scaffold/msg/PendingDetection.msg  ~/bv_ws/src/bv_msgs/msg/
-cp -r /path/to/bv_gcs_msgs_scaffold/srv/DetectionDecision.srv ~/bv_ws/src/bv_msgs/srv/
-```
+## Setup
 
-Then add them to `bv_msgs/CMakeLists.txt`:
-
-```cmake
-rosidl_generate_interfaces(${PROJECT_NAME}
-  # ...existing entries...
-  "msg/PendingDetection.msg"
-  "srv/DetectionDecision.srv"
-  DEPENDENCIES std_msgs
-)
-```
-
-`std_msgs` is already a build dep in `bv_msgs/package.xml` (used by the existing `ObjectDetections.msg`), so no `package.xml` change is needed.
-
-### 2. Clone bv_gcs into your workspace
-
-```bash
-cd ~/bv_ws/src
-git clone https://github.com/BuckeyeVertical/bv_gcs.git
-```
-
-### 3. Install rosbridge_suite on the drone
-
-If you're using the Docker images from `bv_core/container/`, this is already added. Otherwise:
+Requires ROS 2 Humble, `bv_msgs` (with `PendingDetection.msg` and
+`DetectionDecision.srv`), and `python3-aiohttp`. Node.js 20+ is needed only on a
+development machine to build the frontend — never on the drone.
 
 ```bash
-sudo apt install ros-humble-rosbridge-suite
+cd ~/bv_ws/src/bv_gcs/web && npm install && npm run build   # once, on a dev machine
+cd ~/bv_ws && colcon build --packages-select bv_msgs bv_gcs
+source install/setup.bash
 ```
 
-### 4. Build
+The `npm run build` step is optional but recommended: it produces `web/dist`, which
+`setup.py` installs and `approval_node` serves. Skip it and `/` shows a placeholder
+telling you what to do.
 
-```bash
-cd ~/bv_ws
-colcon build --packages-select bv_msgs bv_gcs bv_core
-source install/local_setup.bash
+## Running
 
-# Sanity check:
-ros2 interface show bv_msgs/msg/PendingDetection
-ros2 interface show bv_msgs/srv/DetectionDecision
-```
-
-### 5. Install web frontend dependencies (ground laptop only)
-
-```bash
-cd ~/bv_ws/src/bv_gcs/web
-npm install
-```
-
-See [`web/README.md`](web/README.md) for the full frontend story.
-
-## How to run
-
-The approval gate is wired into `bv_core`'s `mission.launch.py`. There are three useful invocations.
-
-### A. Full stack with human approval (typical)
-
-On the drone:
+### On the drone
 
 ```bash
 ros2 launch bv_core mission.launch.py human_approval_required:=true
 ```
 
-This launches everything `mission.launch.py` normally does **plus**:
-- `approval_node` (`bv_gcs`) — the gate node.
-- `rosbridge_websocket` on port `9090` (customizable via `rosbridge_port:=...`).
-- `mission_node` configured to listen to `/approved_obj_dets` instead of `/global_obj_dets`.
+### On the ground laptop
 
-`true` is the default for `human_approval_required`, so just `ros2 launch bv_core mission.launch.py` also works.
+Open `http://<drone-ip>:8765`. That's the whole procedure — no Node, no npm, no vite.
+Any device on the Herelink WiFi works, including a phone or a spare laptop.
 
-On the ground laptop:
+### Frontend development
 
 ```bash
 cd ~/bv_ws/src/bv_gcs/web
-VITE_ROS_URL=ws://<drone-ip>:9090 npm run dev
-# Open http://localhost:5173
+GCS_TARGET=http://<drone-ip>:8765 npm run dev    # defaults to 127.0.0.1:8765
 ```
 
-Wait for `ConnectionStatus` to turn green, then trigger a scan. When filtering's 3-frame confirmation fires, the right panel will show the pending detection and the map will fly to the detection pin. Press **A** to approve or **R** to reject.
+`vite.config.ts` proxies `/ws`, `/frame`, and `/healthz` to that target, so the dev
+server and the served bundle run identical client code. Remember to `npm run build` and
+rebuild the package before flying — `approval_node` logs the `dist/` build timestamp at
+startup so a stale bundle is visible in the logs.
 
-### B. Autonomous (no human in the loop)
+## Testing without a drone
 
-```bash
-ros2 launch bv_core mission.launch.py human_approval_required:=false
-```
-
-`approval_node` and `rosbridge_websocket` are skipped. `mission_node` subscribes directly to `/global_obj_dets`. Original behavior — useful for full-auto regression testing.
-
-### C. GCS pieces only (bag replay / frontend dev)
-
-If you're replaying a bag or otherwise running `mission_node` / `filtering_node` separately and only want the approval gate + bridge:
+`fake_pending` stands in for `mission_node`: it publishes a synthetic detection with a
+real JPEG and serves `/detection_decision`, logging whatever verdict arrives.
 
 ```bash
-ros2 launch bv_gcs gcs.launch.py rosbridge_port:=9090
-```
-
-This launches just `approval_node` and `rosbridge_websocket`.
-
-## Smoke-testing approval_node from the CLI
-
-You can drive the gate without the browser to verify the wiring before bringing up the frontend:
-
-```bash
-# Terminal 1 — gate only
 ros2 launch bv_gcs gcs.launch.py
-
-# Terminal 2 — simulate filtering's confirmation
-ros2 topic pub --once /pending_obj_dets bv_msgs/msg/PendingDetection \
-  "{header: {frame_id: 'map'}, detection_id: '', class_id: 1,
-    latitude: 38.387634, longitude: -76.419021, altitude: 25.0,
-    confidence: 0.0, drone_latitude: 38.3876, drone_longitude: -76.4190}"
-
-# Terminal 3 — verify the latched topic shows the pending
-ros2 topic echo /pending_obj_dets_active --once
-# (detection_id will be a UUID assigned by approval_node)
-
-# Terminal 4 — approve it (use the detection_id from terminal 3)
-ros2 service call /detection_decision bv_msgs/srv/DetectionDecision \
-  "{detection_id: '<uuid-from-echo>', approved: true, reason: ''}"
-
-# Terminal 5 — verify the class_id flows through
-ros2 topic echo /approved_obj_dets
-# Should print: data: 1
+ros2 run bv_gcs fake_pending --ros-args -p timeout_sec:=45.0
 ```
 
-A stale `detection_id` returns `accepted: false` with `message: "detection_id mismatch ..."`.
-
-## Package layout
-
-```
-bv_gcs/
-├── package.xml, setup.py, setup.cfg, resource/bv_gcs
-├── bv_gcs/
-│   ├── __init__.py
-│   └── approval_node.py
-├── launch/gcs.launch.py
-├── config/approval_params.yaml
-└── web/                          # Vite + React + TS frontend — see web/README.md
-```
+Open `http://localhost:8765`, press **A** or **R**, and watch the verdict land in the
+`fake_pending` log. It publishes a fresh detection a few seconds after each decision so
+you can click through repeatedly (`-p auto_repeat:=false` to stop that).
 
 ## Troubleshooting
 
-- **Browser says DISCONNECTED.** Confirm `rosbridge_websocket` is running (`ros2 node list | grep rosbridge`) and that `VITE_ROS_URL` points at the right host/port. The bridge defaults to `0.0.0.0:9090` and is reachable from any host on the LAN.
-- **Detection arrives but no popup.** Check `ros2 topic echo /pending_obj_dets_active` on the drone — if the topic is silent, the publish side is the problem (filtering didn't fire confirmation, or `approval_node` is dropping it because another pending is still active). If the topic is publishing but the browser doesn't react, check the browser console for `roslib` errors and confirm `bv_msgs` is built so the message type is resolvable.
-- **APPROVE clicked but mission doesn't transition.** Verify `mission_node` is subscribed to `/approved_obj_dets`, not `/global_obj_dets`. The launch arg `human_approval_required:=true` handles this; running `mission_node` standalone needs `--ros-args -p confirmed_topic:=/approved_obj_dets`.
-- **Late-joining browser misses a detection.** The latched `/pending_obj_dets_active` topic should deliver it on subscribe. If it doesn't, confirm `rosbridge_suite` is recent enough to forward `TRANSIENT_LOCAL` durability (Humble's packaged version does).
-# bv_gcs
+- **Browser says DISCONNECTED.** Check `approval_node` is up (`ros2 node list`) and that
+  port 8765 is reachable. The client reconnects on its own with backoff — no reload needed.
+- **`address already in use` on startup.** A second `approval_node` is running. The node
+  logs this explicitly; use `-p ws_port:=...` or stop the other one.
+- **Detection arrives but no image.** The panel says so explicitly rather than showing
+  blank. Check `ros2 topic echo /pending_obj_dets --field annotated_crop.format` — an
+  empty crop means `vision_node` didn't populate it.
+- **Approve clicked, nothing happens.** The UI only clears when `mission_node` publishes
+  a cleared pending, so a stuck panel means the verdict didn't reach the FSM. Check
+  `/healthz` and the `approval_node` log for the service response.
+- **Stale UI after a frontend change.** `approval_node` logs the `dist/` build time at
+  startup. Rebuild with `npm run build` and re-run `colcon build`.

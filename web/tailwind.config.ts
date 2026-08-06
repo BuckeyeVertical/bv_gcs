@@ -25,9 +25,17 @@ const config: Config = {
           red: '#f85149',
         },
       },
+      // System stacks only — the ground laptop has no internet over Herelink, so a
+      // webfont CDN would just stall and fall back to these anyway.
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
-        mono: ['"JetBrains Mono"', '"IBM Plex Mono"', 'ui-monospace', 'monospace'],
+        sans: [
+          'system-ui', '-apple-system', 'Segoe UI', 'Roboto',
+          'Helvetica Neue', 'sans-serif',
+        ],
+        mono: [
+          'ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas',
+          'DejaVu Sans Mono', 'monospace',
+        ],
       },
     },
   },

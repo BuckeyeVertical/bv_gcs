@@ -31,7 +31,7 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from bv_msgs.msg import PendingDetection
 from bv_msgs.srv import DetectionDecision
@@ -100,6 +100,14 @@ class ApprovalNode(Node):
         reliable.reliability = ReliabilityPolicy.RELIABLE
         reliable.history = HistoryPolicy.KEEP_LAST
 
+        # TRANSIENT_LOCAL matches mission_node's latched publisher, so a
+        # restarted approval_node or a recovered link immediately receives the
+        # live pending instead of showing an empty dashboard.
+        latched = QoSProfile(depth=1)
+        latched.reliability = ReliabilityPolicy.RELIABLE
+        latched.history = HistoryPolicy.KEEP_LAST
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
         best_effort = QoSProfile(depth=1)
         best_effort.reliability = ReliabilityPolicy.BEST_EFFORT
         best_effort.history = HistoryPolicy.KEEP_LAST
@@ -107,7 +115,7 @@ class ApprovalNode(Node):
         self._cb_group = ReentrantCallbackGroup()
 
         self.create_subscription(
-            PendingDetection, '/pending_obj_dets', self._on_pending, reliable,
+            PendingDetection, '/pending_obj_dets', self._on_pending, latched,
             callback_group=self._cb_group)
         self.create_subscription(
             String, '/mission_state', self._on_mission_state, reliable,

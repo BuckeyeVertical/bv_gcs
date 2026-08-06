@@ -130,6 +130,9 @@ class ApprovalNode(Node):
         # Shared state, read by the asyncio thread when building a snapshot.
         self._active: dict | None = None
         self._active_received_mono: float = 0.0
+        # How much of the timeout had already elapsed when this arrived. Nonzero
+        # only when we joined a decision already in progress (see _initial_age).
+        self._active_initial_age: float = 0.0
         self._mission_state: str | None = None
         self._drone_fix: dict | None = None
         self._frames: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
@@ -171,8 +174,13 @@ class ApprovalNode(Node):
 
         with self._lock:
             previous = self._active
+            already_tracking = (
+                previous is not None
+                and previous['detection_id'] == msg.detection_id)
             self._active = payload
-            self._active_received_mono = time.monotonic()
+            if not already_tracking:
+                self._active_received_mono = time.monotonic()
+                self._active_initial_age = self._initial_age(msg)
 
         if previous and previous['detection_id'] != msg.detection_id:
             # mission_node is authoritative and should never have two open at once.
@@ -189,6 +197,39 @@ class ApprovalNode(Node):
             f"image={'yes' if image_bytes else 'MISSING'}")
 
         self._emit({'type': 'pending', 'pending': self.pending_for_send()})
+
+    def _initial_age(self, msg: PendingDetection) -> float:
+        """Seconds of the timeout already spent before this message reached us.
+
+        Normally zero — the pending arrives the instant mission_node publishes
+        it. But the latched (TRANSIENT_LOCAL) publisher exists precisely so a
+        restarted approval_node picks up a decision already in progress, and
+        there, treating arrival as t=0 renders a full countdown when the real
+        deadline may be seconds away. The operator would deliberate against a
+        false clock while the drone deploys underneath them.
+
+        mission_node stamps the header, so the elapsed time is recoverable. It
+        depends on the two machines' clocks agreeing, so it is only trusted when
+        the result is plausible: a zero stamp (no stamp), a negative age (skew
+        the wrong way) or an age past the deadline all fall back to 0.0, which
+        is the previous behaviour and never shows a negative countdown.
+        """
+        stamp_sec = float(msg.header.stamp.sec) + msg.header.stamp.nanosec * 1e-9
+        if stamp_sec <= 0.0:
+            return 0.0
+        now = self.get_clock().now()
+        age = (now.nanoseconds * 1e-9) - stamp_sec
+        timeout = float(msg.timeout_sec)
+        if age < 0.0 or (timeout > 0.0 and age > timeout):
+            self.get_logger().warn(
+                f"implausible pending age {age:.1f}s from header stamp "
+                f"(timeout={timeout:.0f}s) - counting down from arrival instead")
+            return 0.0
+        if age > 1.0:
+            self.get_logger().info(
+                f"joined a decision already {age:.0f}s old; "
+                f"countdown starts from the real deadline")
+        return age
 
     def _on_mission_state(self, msg: String):
         with self._lock:
@@ -229,16 +270,22 @@ class ApprovalNode(Node):
     def pending_for_send(self) -> dict | None:
         """The active pending, with a freshly computed age.
 
-        `age_sec` is how long ago this arrived, recomputed at send time. The browser
-        derives its countdown deadline from `timeout_sec - age_sec`, so a late-joining
-        client gets the right remaining time and nothing depends on the drone and the
-        ground laptop agreeing on wall-clock time.
+        `age_sec` is how much of the timeout has been spent, recomputed at send time.
+        The browser derives its countdown deadline from `timeout_sec - age_sec`, so a
+        late-joining client gets the right remaining time.
+
+        The elapsed part is monotonic, so ticking never depends on the drone and the
+        ground laptop agreeing on wall-clock time. Only the offset for a decision that
+        was already running when we subscribed comes from the header stamp, and that
+        falls back to zero whenever it looks wrong.
         """
         with self._lock:
             if self._active is None:
                 return None
             payload = dict(self._active)
-            payload['age_sec'] = time.monotonic() - self._active_received_mono
+            payload['age_sec'] = (
+                self._active_initial_age
+                + (time.monotonic() - self._active_received_mono))
             return payload
 
     def snapshot(self) -> dict:

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { ConnectionStatus } from './components/ConnectionStatus';
+import { ConfirmationPanel } from './components/ConfirmationPanel';
 import { MissionStatePanel } from './components/MissionStatePanel';
 import { PendingDetectionPanel } from './components/PendingDetectionPanel';
 import { DetectionImage } from './components/DetectionImage';
@@ -42,6 +43,7 @@ export default function App() {
       <aside className="col-start-1 row-start-2 space-y-3 overflow-y-auto
                         border-r border-bg-border p-3">
         <MissionStatePanel />
+        <ConfirmationPanel />
         <StreamToggle videoRef={videoRef} />
       </aside>
 

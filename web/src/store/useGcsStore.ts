@@ -1,8 +1,8 @@
 import { create } from 'zustand';
 import type {
-  DetectionMarker,
   DroneFix,
   PendingDetection,
+  ConfirmWindow,
   StreamState,
 } from '../net/types';
 
@@ -23,9 +23,9 @@ interface GcsState {
   /** Operator's debug-video toggle, mirrored from the drone's preview_state. */
   previewEnabled: boolean;
   streamState: StreamState;
-  /** Latest detection centres for the overlay; they persist between updates. */
-  detections: DetectionMarker[];
 
+  /** filtering_node's live confirmation window; null until scan starts. */
+  confirmWindow: ConfirmWindow | null;
   setConnected: (v: boolean) => void;
   setMissionState: (s: string | null) => void;
   setDroneFix: (fix: DroneFix | null) => void;
@@ -34,7 +34,7 @@ interface GcsState {
   setLastMessage: (m: string | null) => void;
   setPreviewEnabled: (v: boolean) => void;
   setStreamState: (s: StreamState) => void;
-  setDetections: (d: DetectionMarker[]) => void;
+  setConfirmWindow: (w: ConfirmWindow | null) => void;
 }
 
 export const useGcsStore = create<GcsState>((set) => ({
@@ -47,7 +47,7 @@ export const useGcsStore = create<GcsState>((set) => ({
   lastMessage: null,
   previewEnabled: false,
   streamState: 'off',
-  detections: [],
+  confirmWindow: null,
 
   setConnected: (v) => set({ connected: v }),
   setMissionState: (s) => set({ missionState: s }),
@@ -65,5 +65,5 @@ export const useGcsStore = create<GcsState>((set) => ({
   setLastMessage: (m) => set({ lastMessage: m }),
   setPreviewEnabled: (v) => set({ previewEnabled: v }),
   setStreamState: (s) => set({ streamState: s }),
-  setDetections: (d) => set({ detections: d }),
+  setConfirmWindow: (w) => set({ confirmWindow: w }),
 }));

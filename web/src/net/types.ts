@@ -31,15 +31,26 @@ export interface DecisionAck {
   message: string;
 }
 
-export interface DetectionMarker {
-  /** 0-1, normalised against the source frame. */
-  x: number;
-  y: number;
+export type StreamState = 'off' | 'connecting' | 'live';
+
+/** One class's progress through filtering_node's M-of-N confirmation window. */
+export interface ConfirmClass {
   class_id: number;
-  class_name: string;
+  name: string;
+  /** Oldest frame first; one entry per frame currently held. */
+  hits: boolean[];
+  confirmed: boolean;
 }
 
-export type StreamState = 'off' | 'connecting' | 'live';
+export interface ConfirmWindow {
+  /** Hits needed to confirm (M). */
+  required: number;
+  /** Window length in frames (N). */
+  window: number;
+  /** Frames currently held — below `window` until the window fills. */
+  frames: number;
+  classes: ConfirmClass[];
+}
 
 export type ServerMessage =
   | {
@@ -47,6 +58,7 @@ export type ServerMessage =
       pending: PendingDetection | null;
       mission_state: string | null;
       drone_fix: DroneFix | null;
+      confirm_window: ConfirmWindow | null;
     }
   | { type: 'pending'; pending: PendingDetection | null }
   | { type: 'mission_state'; data: string }
@@ -57,5 +69,5 @@ export type ServerMessage =
       accepted: boolean;
       message: string;
     }
-  | { type: 'detections'; dets: DetectionMarker[] }
-  | { type: 'preview_state'; enabled: boolean };
+  | { type: 'preview_state'; enabled: boolean }
+  | { type: 'confirm_window'; window: ConfirmWindow };

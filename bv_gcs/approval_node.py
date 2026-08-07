@@ -20,7 +20,7 @@ image without disturbing the decision path.
 The debug video relay rides alongside, on its own WebSocket at `/video`:
 
     vision_node --/preview_stream--> approval_node --binary WS /video--> browser
-                <--/preview_enabled--             --JSON WS /ws (markers)-->
+                <--/preview_enabled--                <--JSON WS /ws (toggle)--
 
 `/video` is deliberately *not* `/ws`. Sharing one socket would let a backlog of
 H.264 delay an approval verdict — the aircraft would still be safe, since
@@ -43,7 +43,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from bv_msgs.msg import ObjectDetections, PendingDetection
+from bv_msgs.msg import PendingDetection
 from bv_msgs.srv import DetectionDecision
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, String, UInt8MultiArray
@@ -70,30 +70,6 @@ def class_name(class_id: int) -> str:
     if 0 <= class_id < len(CLASS_NAMES):
         return CLASS_NAMES[class_id]
     return f"class_{class_id}"
-
-
-def normalise_detections(dets, width: float, height: float) -> list[dict]:
-    """Detection centres in source-sensor pixels -> 0-1, for the video overlay.
-
-    Width and height are supplied separately rather than deriving one from the
-    other: the real camera is 4640x3480 (4:3) and Gazebo is 1280x720 (16:9), so
-    assuming an aspect ratio would misplace every marker vertically in whichever
-    environment did not match the assumption.
-
-    `/obj_dets` carries centres only — `dets` is a Vector3[] where x and y are the
-    centre in source pixels and z is the class id. There are no boxes.
-    """
-    if width <= 0.0 or height <= 0.0:
-        return []
-    return [
-        {
-            'x': float(v.x) / width,
-            'y': float(v.y) / height,
-            'class_id': int(v.z),
-            'class_name': class_name(int(v.z)),
-        }
-        for v in dets
-    ]
 
 
 def video_backlog_bytes(ws: web.WebSocketResponse) -> int:
@@ -278,27 +254,12 @@ class ApprovalNode(Node):
         self.declare_parameter('ws_port', 8765)
         self.declare_parameter('gps_broadcast_hz', 1.0)
         self.declare_parameter('frame_cache_size', 8)
-        # Detection centres arrive in source-sensor pixels. Defaults match the real
-        # camera; config/approval_params.yaml overrides them for Gazebo (1280x720).
-        self.declare_parameter('detection_source_width', 4640)
-        self.declare_parameter('detection_source_height', 3480)
 
         self.ws_host = str(self.get_parameter('ws_host').value)
         self.ws_port = int(self.get_parameter('ws_port').value)
         gps_hz = float(self.get_parameter('gps_broadcast_hz').value)
         self.gps_min_interval = 1.0 / gps_hz if gps_hz > 0 else 0.0
         self.frame_cache_size = int(self.get_parameter('frame_cache_size').value)
-        self.det_source_width = float(
-            self.get_parameter('detection_source_width').value)
-        self.det_source_height = float(
-            self.get_parameter('detection_source_height').value)
-        if self.det_source_width <= 0.0 or self.det_source_height <= 0.0:
-            # Normalising by zero would take out the /obj_dets callback on every
-            # frame. Overlay markers are cosmetic, so complain and disable them.
-            self.get_logger().error(
-                f"detection_source_width/height must be positive, got "
-                f"{self.det_source_width:g}x{self.det_source_height:g} — "
-                f"detection overlay markers are disabled")
 
         reliable = QoSProfile(depth=1)
         reliable.reliability = ReliabilityPolicy.RELIABLE
@@ -321,6 +282,16 @@ class ApprovalNode(Node):
         self.create_subscription(
             PendingDetection, '/pending_obj_dets', self._on_pending, latched,
             callback_group=self._cb_group)
+        # filtering_node's live confirmation window, latched so a GCS that connects
+        # mid-scan sees it at once. Purely informational: nothing here feeds back
+        # into what the aircraft confirms.
+        window_qos = QoSProfile(depth=1)
+        window_qos.reliability = ReliabilityPolicy.RELIABLE
+        window_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        window_qos.history = HistoryPolicy.KEEP_LAST
+        self.create_subscription(
+            String, '/confirmation_window', self._on_confirm_window, window_qos,
+            callback_group=self._cb_group)
         self.create_subscription(
             String, '/mission_state', self._on_mission_state, reliable,
             callback_group=self._cb_group)
@@ -341,9 +312,6 @@ class ApprovalNode(Node):
         self.create_subscription(
             UInt8MultiArray, '/preview_stream', self._on_preview_chunk,
             preview_qos, callback_group=self._cb_group)
-        self.create_subscription(
-            ObjectDetections, '/obj_dets', self._on_detections, best_effort,
-            callback_group=self._cb_group)
 
         # Latched so vision_node picks up the operator's current choice even if it
         # (re)starts after the toggle was flipped.
@@ -359,6 +327,7 @@ class ApprovalNode(Node):
         # only when we joined a decision already in progress (see _initial_age).
         self._active_initial_age: float = 0.0
         self._mission_state: str | None = None
+        self._confirm_window: dict | None = None
         self._drone_fix: dict | None = None
         self._frames: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._last_gps_emit = 0.0
@@ -464,6 +433,23 @@ class ApprovalNode(Node):
             self._mission_state = msg.data
         self._emit({'type': 'mission_state', 'data': msg.data})
 
+    def _on_confirm_window(self, msg: String):
+        """Relay filtering_node's confirmation window to the browser.
+
+        Malformed JSON is dropped rather than raised: this is a debug view, and a
+        parse error must not take out the callback group that also carries pending
+        detections.
+        """
+        try:
+            window = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            if window == self._confirm_window:
+                return
+            self._confirm_window = window
+        self._emit({'type': 'confirm_window', 'window': window})
+
     def _on_gps(self, msg: NavSatFix):
         """Forward the drone position, throttled — MAVROS publishes far faster than
         a constrained link should carry."""
@@ -488,13 +474,6 @@ class ApprovalNode(Node):
         """
         if self.emit_video is not None:
             self.emit_video(bytes(msg.data))
-
-    def _on_detections(self, msg: ObjectDetections):
-        """Forward detection centres, normalised to 0-1 so the browser never needs
-        to know the sensor resolution."""
-        dets = normalise_detections(
-            msg.dets, self.det_source_width, self.det_source_height)
-        self._emit({'type': 'detections', 'dets': dets})
 
     def set_preview_enabled(self, enabled: bool):
         """Publish the operator's toggle to vision_node."""
@@ -539,11 +518,13 @@ class ApprovalNode(Node):
         with self._lock:
             mission_state = self._mission_state
             drone_fix = dict(self._drone_fix) if self._drone_fix else None
+            confirm_window = self._confirm_window
         return {
             'type': 'snapshot',
             'pending': self.pending_for_send(),
             'mission_state': mission_state,
             'drone_fix': drone_fix,
+            'confirm_window': confirm_window,
         }
 
     def _emit(self, payload: dict):

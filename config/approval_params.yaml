@@ -12,14 +12,6 @@ approval_node:
     # How many recent annotated crops to keep in memory for GET /frame/<id>.
     frame_cache_size: 8
 
-    # Source frame dimensions that /obj_dets centres are expressed in. Real camera
-    # is 4640x3480; set to 1280x720 when running against Gazebo, or markers will
-    # land in the wrong place on the video overlay. Width and height are separate
-    # on purpose — the two cameras have different aspect ratios (4:3 vs 16:9), so
-    # deriving one from the other would misplace every marker vertically.
-    detection_source_width: 4640
-    detection_source_height: 3480
-
 # NOTE: the approval timeout is deliberately NOT configured here. mission_node owns
 # it (Approval_timeout_sec in bv_core/config/mission_params.yaml) so the aircraft
 # still recovers if this process or the radio link dies.

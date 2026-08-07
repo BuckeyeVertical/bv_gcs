@@ -72,6 +72,10 @@ function handleMessage(raw: string) {
       store.setMissionState(msg.mission_state);
       store.setDroneFix(msg.drone_fix);
       store.setActivePending(msg.pending);
+      store.setConfirmWindow(msg.confirm_window);
+      break;
+    case 'confirm_window':
+      store.setConfirmWindow(msg.window);
       break;
     case 'pending':
       store.setActivePending(msg.pending);
@@ -90,9 +94,6 @@ function handleMessage(raw: string) {
         accepted: msg.accepted,
         message: msg.message,
       });
-      break;
-    case 'detections':
-      store.setDetections(msg.dets);
       break;
     case 'preview_state':
       store.setPreviewEnabled(msg.enabled);

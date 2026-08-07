@@ -1,113 +1,65 @@
-import { useCallback, useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
-import type { DetectionMarker } from '../net/types';
 import { useGcsStore } from '../store/useGcsStore';
 
-const MARKER = '#54dc40';
-
 /**
- * Markers are normalised against the source frame, so they belong in the rectangle
- * the video is actually painted in — not the panel. The video is letterboxed inside
- * the panel (max-h/max-w), and the two rects differ whenever the feed's aspect ratio
- * does not match the column's, which is the normal case.
+ * Mission states in which vision_node keeps the camera pipeline running, and so the
+ * only ones that can produce preview frames. Outside them the encoder is stopped and
+ * the <video> element holds its last decoded frame indefinitely — a still picture
+ * that is indistinguishable from a live one showing a stationary scene. Say so
+ * explicitly rather than letting the operator trust a stale frame.
  */
-function draw(
-  canvas: HTMLCanvasElement,
-  video: HTMLVideoElement,
-  dets: DetectionMarker[],
-) {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
-  canvas.width = canvas.clientWidth;
-  canvas.height = canvas.clientHeight;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  // No frames means no rect to place markers in — an empty <video> still occupies
-  // a default 300x150 box, and drawing into it would put markers somewhere the
-  // operator could mistake for a position in a picture that isn't there.
-  if (!video.videoWidth || !video.videoHeight) return;
-
-  const cr = canvas.getBoundingClientRect();
-  const vr = video.getBoundingClientRect();
-  const ox = vr.left - cr.left;
-  const oy = vr.top - cr.top;
-
-  for (const d of dets) {
-    const x = ox + d.x * vr.width;
-    const y = oy + d.y * vr.height;
-    ctx.strokeStyle = MARKER;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(x, y, 14, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(x - 22, y);
-    ctx.lineTo(x - 6, y);
-    ctx.moveTo(x + 6, y);
-    ctx.lineTo(x + 22, y);
-    ctx.moveTo(x, y - 22);
-    ctx.lineTo(x, y - 6);
-    ctx.moveTo(x, y + 6);
-    ctx.lineTo(x, y + 22);
-    ctx.stroke();
-    ctx.font = '12px ui-monospace, monospace';
-    ctx.fillStyle = MARKER;
-    ctx.fillText(d.class_name, x + 20, y - 20);
-  }
-}
+const CAPTURE_STATES = ['scan', 'localize'];
 
 /**
- * Live feed with detection markers drawn on a canvas overlay.
+ * Live feed for debugging: is the camera alive, pointed where we think, and exposed
+ * sanely.
  *
- * Markers are drawn browser-side rather than baked into the video: detection
- * runs at 0.67 Hz while video runs at 8 fps, so compositing them server-side
- * would make the video stutter down to the detector's rate. They persist between
- * updates instead.
+ * Deliberately *not* a detection display. Detections arrive at whatever rate the
+ * detector manages (a few per second) and are delivered a full inference behind the
+ * frame they came from, while the aircraft keeps moving — so any marker drawn here
+ * trails the live picture and reads as "the object is here" when it means "it was
+ * there a moment ago".
+ * Detections are judged on the approval card instead, which shows a native-resolution
+ * crop frozen at the instant of detection.
  */
 export function VideoPanel({ videoRef }: {
   videoRef: RefObject<HTMLVideoElement>;
 }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const dets = useGcsStore((s) => s.detections);
   const state = useGcsStore((s) => s.streamState);
+  const missionState = useGcsStore((s) => s.missionState);
 
-  const redraw = useCallback(() => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (canvas && video) draw(canvas, video, dets);
-  }, [dets, videoRef]);
-
-  useEffect(() => {
-    redraw();
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    // The painted rect moves when the panel resizes — including when the approval
-    // column appears, which is not a window resize — when the first frame gives the
-    // video its intrinsic size, and when the source resolution changes.
-    const observer = new ResizeObserver(redraw);
-    if (canvas) observer.observe(canvas);
-    video?.addEventListener('loadedmetadata', redraw);
-    video?.addEventListener('resize', redraw);
-    return () => {
-      observer.disconnect();
-      video?.removeEventListener('loadedmetadata', redraw);
-      video?.removeEventListener('resize', redraw);
-    };
-  }, [redraw, videoRef]);
+  // A frame is only current while the drone is in a capturing state. Treat an
+  // unknown mission state as capturing: before the first /mission_state arrives we
+  // have no evidence the feed is stale, and crying stale over a live picture would
+  // train the operator to ignore the warning.
+  const stale =
+    state === 'live' &&
+    missionState !== null &&
+    !CAPTURE_STATES.includes(missionState.toLowerCase());
 
   return (
     <div className="relative flex h-full w-full items-center justify-center
                     border border-bg-border bg-black/40">
       {/* tabIndex -1 so the video can never take focus and swallow [A]/[R]. */}
       <video ref={videoRef} tabIndex={-1} autoPlay muted playsInline
-             className="max-h-full max-w-full" />
-      <canvas ref={canvasRef}
-              className="pointer-events-none absolute inset-0 h-full w-full" />
+             className={`max-h-full max-w-full ${stale ? 'opacity-40' : ''}`} />
+      {/* Sized and weighted to be readable at a glance across the tent, and given
+          its own dark backing so it stays legible over a paused frame of any
+          brightness rather than only over the empty black panel. */}
       {state !== 'live' && (
-        <div className="absolute font-mono text-[10px] uppercase
-                        tracking-[0.2em] text-ink-dim">
+        <div className="absolute rounded bg-black/75 px-5 py-3 font-mono text-2xl
+                        font-bold uppercase tracking-[0.15em] text-white
+                        shadow-lg ring-1 ring-white/25">
           {state === 'connecting' ? 'Connecting…' : 'Stream off'}
+        </div>
+      )}
+      {/* Banner sits at the top edge rather than centred so it never covers the
+          subject the operator is trying to judge. */}
+      {stale && (
+        <div className="pointer-events-none absolute inset-x-0 top-0 bg-amber-400
+                        px-3 py-2 text-center font-mono text-base font-bold
+                        uppercase tracking-[0.1em] text-black">
+          Capture off in {missionState} — frame is frozen, not live
         </div>
       )}
     </div>

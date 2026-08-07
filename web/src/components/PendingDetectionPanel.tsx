@@ -40,7 +40,9 @@ export function PendingDetectionPanel() {
 
   return (
     <section className="border border-accent-amber/60 bg-bg-panel p-4">
-      <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-6">
+      {/* Stacked, not side by side: this panel now lives in a 360px column beside
+          the live feed, which is too narrow for two columns of detail. */}
+      <div className="flex flex-col gap-4">
         <div className="min-w-0 space-y-3">
           <div className="flex items-baseline gap-3">
             <span className="text-2xl font-bold uppercase tracking-wider text-ink-primary">
@@ -54,7 +56,7 @@ export function PendingDetectionPanel() {
             </span>
           </div>
 
-          <div className="grid grid-cols-3 gap-x-6 gap-y-2 font-mono text-xs sm:grid-cols-5">
+          <div className="grid grid-cols-3 gap-x-4 gap-y-2 font-mono text-xs">
             <Field label="Lat" value={active.latitude.toFixed(6)} />
             <Field label="Lon" value={active.longitude.toFixed(6)} />
             <Field label="Alt" value={`${active.altitude.toFixed(1)} m`} />
@@ -69,7 +71,7 @@ export function PendingDetectionPanel() {
           )}
         </div>
 
-        <div className="w-64 space-y-3">
+        <div className="w-full space-y-3">
           <ApprovalCountdown />
           <DecisionButtons />
         </div>

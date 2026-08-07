@@ -10,10 +10,11 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
-    // Proxying /ws and /frame keeps the dev server and the bundle served from
+    // Proxying /ws, /video and /frame keeps the dev server and the bundle served from
     // approval_node on identical client code — no VITE_GCS_URL, no branching.
     proxy: {
       '/ws': { target, ws: true, changeOrigin: true },
+      '/video': { target, ws: true, changeOrigin: true },
       '/frame': { target, changeOrigin: true },
       '/healthz': { target, changeOrigin: true },
     },

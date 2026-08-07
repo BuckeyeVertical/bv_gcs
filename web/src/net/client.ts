@@ -91,6 +91,12 @@ function handleMessage(raw: string) {
         message: msg.message,
       });
       break;
+    case 'detections':
+      store.setDetections(msg.dets);
+      break;
+    case 'preview_state':
+      store.setPreviewEnabled(msg.enabled);
+      break;
   }
 }
 
@@ -131,6 +137,18 @@ export function connect() {
     // onclose always follows, which is where reconnect is handled.
     socket?.close();
   };
+}
+
+/**
+ * Ask the drone to start or stop the debug preview encoder.
+ *
+ * Fire-and-forget: the drone answers with a `preview_state` message, which is what
+ * actually moves the toggle. A dropped request just means the toggle does not move.
+ */
+export function setPreview(enabled: boolean) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'preview', enabled }));
+  }
 }
 
 export function sendDecision(

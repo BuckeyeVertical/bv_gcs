@@ -31,6 +31,16 @@ export interface DecisionAck {
   message: string;
 }
 
+export interface DetectionMarker {
+  /** 0-1, normalised against the source frame. */
+  x: number;
+  y: number;
+  class_id: number;
+  class_name: string;
+}
+
+export type StreamState = 'off' | 'connecting' | 'live';
+
 export type ServerMessage =
   | {
       type: 'snapshot';
@@ -46,4 +56,6 @@ export type ServerMessage =
       detection_id: string;
       accepted: boolean;
       message: string;
-    };
+    }
+  | { type: 'detections'; dets: DetectionMarker[] }
+  | { type: 'preview_state'; enabled: boolean };

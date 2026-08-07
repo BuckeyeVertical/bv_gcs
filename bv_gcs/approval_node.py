@@ -16,6 +16,16 @@ The annotated crop travels over plain HTTP (`GET /frame/<detection_id>`) rather 
 base64 inside the WebSocket frame. That keeps the control channel responsive on a
 constrained link, avoids base64's 1.33x overhead, and lets the browser retry a failed
 image without disturbing the decision path.
+
+The debug video relay rides alongside, on its own WebSocket at `/video`:
+
+    vision_node --/preview_stream--> approval_node --binary WS /video--> browser
+                <--/preview_enabled--             --JSON WS /ws (markers)-->
+
+`/video` is deliberately *not* `/ws`. Sharing one socket would let a backlog of
+H.264 delay an approval verdict — the aircraft would still be safe, since
+mission_node owns the timeout, but the operator would be clicking Approve into a
+stalled pipe. For the same reason video sends drop rather than queue.
 """
 
 import asyncio
@@ -33,10 +43,10 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from bv_msgs.msg import PendingDetection
+from bv_msgs.msg import ObjectDetections, PendingDetection
 from bv_msgs.srv import DetectionDecision
 from sensor_msgs.msg import NavSatFix
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String, UInt8MultiArray
 
 
 # Mirrors CLASS_NAMES in bv_core. Resolved here so the browser stays dumb and there
@@ -48,12 +58,65 @@ CLASS_NAMES = ("person", "tent")
 # means the link or the node is in trouble.
 DECISION_CALL_TIMEOUT_S = 5.0
 
+# Socket backlog past which a video chunk is dropped instead of sent. Video is
+# expendable and a verdict is not, so a client whose transport is already backed up
+# loses this chunk rather than accumulating an unbounded queue of them in the kernel
+# and in suspended send tasks. The next keyframe recovers the picture.
+VIDEO_BACKLOG_DROP_BYTES = 512_000
+
 
 def class_name(class_id: int) -> str:
     """Human-readable name for a semantic class id."""
     if 0 <= class_id < len(CLASS_NAMES):
         return CLASS_NAMES[class_id]
     return f"class_{class_id}"
+
+
+def normalise_detections(dets, width: float, height: float) -> list[dict]:
+    """Detection centres in source-sensor pixels -> 0-1, for the video overlay.
+
+    Width and height are supplied separately rather than deriving one from the
+    other: the real camera is 4640x3480 (4:3) and Gazebo is 1280x720 (16:9), so
+    assuming an aspect ratio would misplace every marker vertically in whichever
+    environment did not match the assumption.
+
+    `/obj_dets` carries centres only — `dets` is a Vector3[] where x and y are the
+    centre in source pixels and z is the class id. There are no boxes.
+    """
+    if width <= 0.0 or height <= 0.0:
+        return []
+    return [
+        {
+            'x': float(v.x) / width,
+            'y': float(v.y) / height,
+            'class_id': int(v.z),
+            'class_name': class_name(int(v.z)),
+        }
+        for v in dets
+    ]
+
+
+def video_backlog_bytes(ws: web.WebSocketResponse) -> int:
+    """Bytes still queued in this socket's transport, or 0 if unknowable.
+
+    Reaches for aiohttp internals, so every step is guarded: an unexpected shape
+    means "no measurable backlog", which degrades to always sending rather than
+    never sending. A stuck client is then bounded by the transport's own flow
+    control instead of by us, which is worse but not broken.
+    """
+    writer = getattr(ws, '_writer', None)
+    transport = getattr(writer, 'transport', None)
+    if transport is None:
+        return 0
+    try:
+        return int(transport.get_write_buffer_size())
+    except Exception:  # noqa: BLE001 - closing transports raise assorted things
+        return 0
+
+
+def should_send_video(backlog_bytes: int) -> bool:
+    """Whether to send a chunk given the client's current transport backlog."""
+    return backlog_bytes <= VIDEO_BACKLOG_DROP_BYTES
 
 
 def find_frontend_dist() -> str | None:
@@ -89,12 +152,27 @@ class ApprovalNode(Node):
         self.declare_parameter('ws_port', 8765)
         self.declare_parameter('gps_broadcast_hz', 1.0)
         self.declare_parameter('frame_cache_size', 8)
+        # Detection centres arrive in source-sensor pixels. Defaults match the real
+        # camera; config/approval_params.yaml overrides them for Gazebo (1280x720).
+        self.declare_parameter('detection_source_width', 4640)
+        self.declare_parameter('detection_source_height', 3480)
 
         self.ws_host = str(self.get_parameter('ws_host').value)
         self.ws_port = int(self.get_parameter('ws_port').value)
         gps_hz = float(self.get_parameter('gps_broadcast_hz').value)
         self.gps_min_interval = 1.0 / gps_hz if gps_hz > 0 else 0.0
         self.frame_cache_size = int(self.get_parameter('frame_cache_size').value)
+        self.det_source_width = float(
+            self.get_parameter('detection_source_width').value)
+        self.det_source_height = float(
+            self.get_parameter('detection_source_height').value)
+        if self.det_source_width <= 0.0 or self.det_source_height <= 0.0:
+            # Normalising by zero would take out the /obj_dets callback on every
+            # frame. Overlay markers are cosmetic, so complain and disable them.
+            self.get_logger().error(
+                f"detection_source_width/height must be positive, got "
+                f"{self.det_source_width:g}x{self.det_source_height:g} — "
+                f"detection overlay markers are disabled")
 
         reliable = QoSProfile(depth=1)
         reliable.reliability = ReliabilityPolicy.RELIABLE
@@ -124,6 +202,27 @@ class ApprovalNode(Node):
             NavSatFix, '/mavros/global_position/global', self._on_gps, best_effort,
             callback_group=self._cb_group)
 
+        # Matches vision_node's /preview_stream publisher (RELIABLE, KEEP_LAST,
+        # depth 10). Deliberately not BEST_EFFORT: both nodes sit on the drone with
+        # no radio between them, and fragmented-MP4 chunks are not independently
+        # droppable — losing one stalls the browser's MSE decoder rather than
+        # merely skipping a frame. Dropping is done later, per client, where we
+        # can see which client is actually struggling.
+        preview_qos = QoSProfile(depth=10)
+        preview_qos.reliability = ReliabilityPolicy.RELIABLE
+        preview_qos.history = HistoryPolicy.KEEP_LAST
+
+        self.create_subscription(
+            UInt8MultiArray, '/preview_stream', self._on_preview_chunk,
+            preview_qos, callback_group=self._cb_group)
+        self.create_subscription(
+            ObjectDetections, '/obj_dets', self._on_detections, best_effort,
+            callback_group=self._cb_group)
+
+        # Latched so vision_node picks up the operator's current choice even if it
+        # (re)starts after the toggle was flipped.
+        self.preview_pub = self.create_publisher(Bool, '/preview_enabled', latched)
+
         self.decision_client = self.create_client(
             DetectionDecision, '/detection_decision', callback_group=self._cb_group)
 
@@ -141,6 +240,7 @@ class ApprovalNode(Node):
 
         # Set by GcsServer once its event loop is running.
         self.emit = None
+        self.emit_video = None
 
     # -- ROS callbacks ----------------------------------------------------------
 
@@ -254,6 +354,27 @@ class ApprovalNode(Node):
             self._drone_fix = fix
         self._emit({'type': 'drone_fix', **fix})
 
+    def _on_preview_chunk(self, msg: UInt8MultiArray):
+        """Forward one fragmented-MP4 chunk to the video socket.
+
+        With no video client connected this costs one attribute test and a call
+        that returns immediately — nothing is copied, cached or queued here.
+        """
+        if self.emit_video is not None:
+            self.emit_video(bytes(msg.data))
+
+    def _on_detections(self, msg: ObjectDetections):
+        """Forward detection centres, normalised to 0-1 so the browser never needs
+        to know the sensor resolution."""
+        dets = normalise_detections(
+            msg.dets, self.det_source_width, self.det_source_height)
+        self._emit({'type': 'detections', 'dets': dets})
+
+    def set_preview_enabled(self, enabled: bool):
+        """Publish the operator's toggle to vision_node."""
+        self.preview_pub.publish(Bool(data=bool(enabled)))
+        self.get_logger().info(f"debug preview {'ON' if enabled else 'OFF'}")
+
     # -- state helpers ----------------------------------------------------------
 
     def _cache_frame(self, detection_id: str, fmt: str, data: bytes):
@@ -352,6 +473,12 @@ class GcsServer:
     def __init__(self, node: ApprovalNode):
         self.node = node
         self.clients: set[web.WebSocketResponse] = set()
+        # Video rides a *separate* endpoint and a separate client set from control.
+        # Sharing one socket would let a backlog of H.264 delay an approval verdict:
+        # the aircraft would still be safe (mission_node owns the timeout) but the
+        # operator would be clicking Approve into a stalled pipe at exactly the
+        # moment it matters. Keep the two sets and the two paths strictly apart.
+        self.video_clients: set[web.WebSocketResponse] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.dist_dir = find_frontend_dist()
 
@@ -372,6 +499,34 @@ class GcsServer:
                 await ws.send_str(text)
             except (ConnectionResetError, RuntimeError):
                 self.clients.discard(ws)
+
+    def emit_video_threadsafe(self, chunk: bytes):
+        """Called from the ROS executor thread.
+
+        Returns without scheduling anything when nobody is watching, so an
+        unwatched stream is dropped here rather than buffered anywhere.
+        """
+        if self.loop is None or self.loop.is_closed() or not self.video_clients:
+            return
+        asyncio.run_coroutine_threadsafe(self._broadcast_video(chunk), self.loop)
+
+    async def _broadcast_video(self, chunk: bytes):
+        """Send to video clients, dropping rather than queueing.
+
+        A client whose transport is already backed up loses this chunk instead of
+        piling up suspended sends that each pin a chunk in memory. Video is
+        expendable; the next keyframe recovers the picture. A verdict is not.
+        """
+        for ws in list(self.video_clients):
+            try:
+                if ws.closed:
+                    self.video_clients.discard(ws)
+                    continue
+                if not should_send_video(video_backlog_bytes(ws)):
+                    continue
+                await ws.send_bytes(chunk)
+            except (ConnectionResetError, RuntimeError):
+                self.video_clients.discard(ws)
 
     # -- handlers ---------------------------------------------------------------
 
@@ -398,10 +553,38 @@ class GcsServer:
                     continue
                 if data.get('type') == 'decision':
                     await self._handle_decision(ws, data)
+                elif data.get('type') == 'preview':
+                    enabled = bool(data.get('enabled'))
+                    self.node.set_preview_enabled(enabled)
+                    await ws.send_str(json.dumps({
+                        'type': 'preview_state',
+                        'enabled': enabled,
+                    }))
         finally:
             self.clients.discard(ws)
             self.node.get_logger().info(
                 f"GCS client {peer} disconnected ({len(self.clients)} left)")
+        return ws
+
+    async def video_handler(self, request: web.Request) -> web.WebSocketResponse:
+        """Dedicated video socket, separate from /ws.
+
+        max_msg_size=0 lifts aiohttp's inbound cap, which is irrelevant for the
+        outbound chunks but would otherwise apply to this socket too.
+        """
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0)
+        await ws.prepare(request)
+        self.video_clients.add(ws)
+        self.node.get_logger().info(
+            f"video client connected from {request.remote} "
+            f"({len(self.video_clients)} total)")
+        try:
+            async for _ in ws:
+                pass          # clients never send on this socket
+        finally:
+            self.video_clients.discard(ws)
+            self.node.get_logger().info(
+                f"video client disconnected ({len(self.video_clients)} left)")
         return ws
 
     async def _handle_decision(self, ws: web.WebSocketResponse, data: dict):
@@ -443,6 +626,7 @@ class GcsServer:
     async def health_handler(self, _request: web.Request) -> web.Response:
         return web.json_response({
             'clients': len(self.clients),
+            'video_clients': len(self.video_clients),
             'pending': self.node.pending_for_send(),
             'mission_state': self.node.snapshot()['mission_state'],
             'frontend': self.dist_dir or 'not built',
@@ -468,6 +652,7 @@ class GcsServer:
     def build_app(self) -> web.Application:
         app = web.Application()
         app.router.add_get('/ws', self.ws_handler)
+        app.router.add_get('/video', self.video_handler)
         app.router.add_get('/frame/{detection_id}', self.frame_handler)
         app.router.add_get('/healthz', self.health_handler)
 
@@ -491,6 +676,7 @@ class GcsServer:
     async def run(self):
         self.loop = asyncio.get_running_loop()
         self.node.emit = self.emit_threadsafe
+        self.node.emit_video = self.emit_video_threadsafe
 
         runner = web.AppRunner(self.build_app())
         await runner.setup()
@@ -509,12 +695,12 @@ class GcsServer:
 
         self.node.get_logger().info(
             f"approval_node listening on http://{self.node.ws_host}:{self.node.ws_port}"
-            f"  (ws://.../ws)")
+            f"  (ws://.../ws, video on ws://.../video)")
 
         try:
             await asyncio.Event().wait()   # run until cancelled
         finally:
-            for ws in list(self.clients):
+            for ws in list(self.clients) + list(self.video_clients):
                 await ws.close()
             await runner.cleanup()
 

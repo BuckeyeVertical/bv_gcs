@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from bv_msgs.msg import PendingDetection
 from bv_msgs.srv import DetectionDecision
@@ -77,7 +78,16 @@ class FakePending(Node):
         self.auto_repeat = bool(self.get_parameter('auto_repeat').value)
         self.repeat_delay = float(self.get_parameter('repeat_delay_sec').value)
 
-        self.pub = self.create_publisher(PendingDetection, '/pending_obj_dets', 10)
+        # Must mirror mission_node's latched publisher, which is what this node
+        # stands in for. approval_node subscribes TRANSIENT_LOCAL so a restarted
+        # ground station picks up a decision already in progress; a VOLATILE
+        # publisher here is simply incompatible and delivers nothing at all.
+        latched = QoSProfile(depth=1)
+        latched.reliability = ReliabilityPolicy.RELIABLE
+        latched.history = HistoryPolicy.KEEP_LAST
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+        self.pub = self.create_publisher(PendingDetection, '/pending_obj_dets', latched)
         self.create_service(
             DetectionDecision, '/detection_decision', self._on_decision)
 

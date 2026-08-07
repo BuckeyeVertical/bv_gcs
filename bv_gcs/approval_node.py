@@ -119,6 +119,132 @@ def should_send_video(backlog_bytes: int) -> bool:
     return backlog_bytes <= VIDEO_BACKLOG_DROP_BYTES
 
 
+# Top-level MP4 boxes that make up a fragmented-MP4 *initialisation segment*.
+# Everything else on /preview_stream is media (`moof`/`mdat`) and is useless to a
+# decoder that has not seen these first.
+INIT_SEGMENT_BOXES = (b'ftyp', b'moov')
+
+# Ceiling on the remembered init segment. Ours is under 1 KiB (32 B ftyp + ~861 B
+# moov); the cap only exists so a malformed length field can never make this grow
+# without bound.
+MAX_INIT_SEGMENT_BYTES = 256 * 1024
+
+# Every top-level box this encoder can emit. Anything else at what we believe is a
+# box boundary means we are not on one, and the parser resynchronises.
+TOP_LEVEL_BOXES = (b'ftyp', b'moov', b'moof', b'mdat', b'styp', b'sidx',
+                   b'free', b'skip', b'mfra')
+
+# Largest plausible top-level box. The preview runs at 400 kbps in 200 ms
+# fragments, so a real one is kilobytes; a length read out of H.264 payload by a
+# desynchronised parser is routinely hundreds of megabytes.
+MAX_BOX_BYTES = 32 * 1024 * 1024
+
+
+class VideoInitCache:
+    """Remembers the fMP4 initialisation segment so late joiners can decode.
+
+    vision_node's encoder is `mp4mux ... streamable=true`, which emits `ftyp` and
+    `moov` exactly once, when the pipeline starts, and nothing but `moof`/`mdat`
+    after that. The relay is otherwise stateless, so a browser that opens /video
+    while the encoder is already running never sees those two chunks: its first
+    appendBuffer is a `moof`, MSE rejects a media segment with no init segment,
+    the SourceBuffer errors, the MediaSource closes and the <video> ends up with
+    error code 4 and a permanently black frame. Since the operator normally opens
+    the page *after* the mission is up, that is the common case, not the corner.
+
+    So we watch the chunk stream, keep whatever belongs to the init segment, and
+    replay it to each new client before the live chunks. A fresh `ftyp` means the
+    encoder rebuilt (a tier change or a resolution change), so the old init is
+    dropped rather than added to.
+
+    Chunk boundaries do not line up with box boundaries — a `mdat` arrives as an
+    8-byte header chunk followed by its payload — so this tracks how many bytes of
+    the current top-level box are still outstanding instead of trying to parse
+    every chunk from its first byte. Without that, a payload chunk that happened
+    to begin with the bytes 'moov' would be mistaken for an init segment.
+
+    Thread-safe: observe() runs on the ROS executor thread, snapshot() on the
+    aiohttp event loop.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._chunks: list[bytes] = []
+        self._bytes = 0
+        self._remaining = 0       # unconsumed bytes of the box currently in flight
+        self._collecting = False  # ...and whether that box is part of the init segment
+        self._seen_any = False    # has anything at all come down /preview_stream
+
+    def observe(self, chunk: bytes) -> bool:
+        """Classify one outbound chunk, remembering it if it is init data.
+
+        Returns whether this chunk *begins* a media fragment (`moof`), which is
+        the only point at which a new client can be handed the live stream
+        without receiving the tail of a fragment whose header it never saw.
+        """
+        with self._lock:
+            self._seen_any = True
+            keep = False
+            starts_fragment = (
+                self._remaining == 0
+                and len(chunk) >= 8
+                and chunk[4:8] == b'moof'
+            )
+            i = 0
+            while i < len(chunk):
+                if self._remaining > 0:
+                    take = min(self._remaining, len(chunk) - i)
+                    keep = keep or self._collecting
+                    self._remaining -= take
+                    i += take
+                    continue
+                if len(chunk) - i < 8:
+                    # A box header split across chunks. Never happens with this
+                    # encoder; resync rather than guess.
+                    self._collecting = False
+                    break
+                size = int.from_bytes(chunk[i:i + 4], 'big')
+                box = chunk[i + 4:i + 8]
+                if box not in TOP_LEVEL_BOXES or not 8 <= size <= MAX_BOX_BYTES:
+                    # We are not on a box boundary after all — the relay started
+                    # mid-stream, so the first chunk it ever saw was the middle of
+                    # a `mdat` and everything since has been parsed against a
+                    # length read out of H.264 payload. Give up on this chunk and
+                    # start again from byte 0 of the next one: chunks do begin on
+                    # box boundaries, so the next `moof` or `ftyp` resynchronises
+                    # us. Without this, one bogus length (they are easily hundreds
+                    # of megabytes) swallows the stream for hours, no boundary is
+                    # ever reported and no client is ever admitted.
+                    self._remaining = 0
+                    self._collecting = False
+                    break
+                if box == b'ftyp':
+                    # Encoder restarted: this init supersedes the one we hold.
+                    self._chunks = []
+                    self._bytes = 0
+                self._collecting = box in INIT_SEGMENT_BOXES
+                self._remaining = size
+            if keep and self._bytes + len(chunk) <= MAX_INIT_SEGMENT_BYTES:
+                self._chunks.append(chunk)
+                self._bytes += len(chunk)
+            return starts_fragment
+
+    def snapshot(self) -> list[bytes]:
+        """The init chunks to replay to a client that has just connected."""
+        with self._lock:
+            return list(self._chunks)
+
+    def missed_the_header(self) -> bool:
+        """Chunks have flowed but their header was emitted before we existed.
+
+        Distinguishes "the encoder has not started yet, wait for it" — the normal
+        state when the operator has just clicked Start stream — from "the encoder
+        is running and its one-and-only header is unrecoverable".
+        """
+        with self._lock:
+            return self._seen_any and not self._chunks
+
+
 def find_frontend_dist() -> str | None:
     """Locate the built frontend, preferring the installed copy.
 
@@ -479,6 +605,12 @@ class GcsServer:
         # operator would be clicking Approve into a stalled pipe at exactly the
         # moment it matters. Keep the two sets and the two paths strictly apart.
         self.video_clients: set[web.WebSocketResponse] = set()
+        # Clients that have had the init segment replayed and are waiting for the
+        # next fragment boundary before they join the live set.
+        self.video_waiting: set[web.WebSocketResponse] = set()
+        # Replayed to each new video client so a browser joining an already-running
+        # encoder gets a decodable stream. See VideoInitCache.
+        self.video_init = VideoInitCache()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.dist_dir = find_frontend_dist()
 
@@ -506,17 +638,43 @@ class GcsServer:
         Returns without scheduling anything when nobody is watching, so an
         unwatched stream is dropped here rather than buffered anywhere.
         """
-        if self.loop is None or self.loop.is_closed() or not self.video_clients:
+        # Before the early return, deliberately: the init segment is emitted the
+        # moment the encoder starts, which is normally *before* anyone is
+        # watching. Missing it here is exactly the bug this cache exists to fix.
+        starts_fragment = self.video_init.observe(chunk)
+        if self.loop is None or self.loop.is_closed():
             return
-        asyncio.run_coroutine_threadsafe(self._broadcast_video(chunk), self.loop)
+        # Schedule for waiting clients too, not only for the boundary chunk that
+        # admits them. Promotion happens on the event loop, so between scheduling
+        # the boundary chunk and that coroutine actually running, this thread sees
+        # video_clients still empty — and would drop the chunks in between. The
+        # `mdat` header is an 8-byte chunk of its own and sits exactly there, so
+        # the client received the `moof`, no `mdat` header, then the payload, and
+        # died with MEDIA_ERR_DECODE. Let the loop decide who gets what.
+        if not self.video_clients and not self.video_waiting:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._broadcast_video(chunk, starts_fragment), self.loop)
 
-    async def _broadcast_video(self, chunk: bytes):
+    async def _broadcast_video(self, chunk: bytes, starts_fragment: bool = False):
         """Send to video clients, dropping rather than queueing.
 
         A client whose transport is already backed up loses this chunk instead of
         piling up suspended sends that each pin a chunk in memory. Video is
         expendable; the next keyframe recovers the picture. A verdict is not.
+
+        A client that has had the init segment replayed waits here until a chunk
+        that starts a `moof`. Handing it the live stream at any other point would
+        begin it with the tail of a fragment whose header it never saw, which the
+        browser's byte-stream parser rejects just as hard as a missing init.
         """
+        if starts_fragment and self.video_waiting:
+            self.video_clients |= self.video_waiting
+            self.video_waiting = set()
+
+        if not self.video_clients:
+            return
+
         for ws in list(self.video_clients):
             try:
                 if ws.closed:
@@ -574,15 +732,45 @@ class GcsServer:
         """
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0)
         await ws.prepare(request)
-        self.video_clients.add(ws)
+        # Init segment first, and before the socket joins the live set, so the
+        # client cannot receive a media fragment ahead of the header that makes it
+        # decodable. Failing to send it is not fatal to the relay: log and carry on
+        # rather than refusing the connection.
+        init = self.video_init.snapshot()
+        try:
+            for chunk in init:
+                await ws.send_bytes(chunk)
+        except (ConnectionResetError, RuntimeError):
+            self.node.get_logger().warn('video client dropped during init replay')
+            return ws
+        # With no init cached (nothing has streamed yet) there is nothing to align
+        # to, so join the live set directly and take the encoder's own header when
+        # it starts. Otherwise wait for the next fragment boundary.
+        if init:
+            self.video_waiting.add(ws)
+        else:
+            self.video_clients.add(ws)
+            if self.video_init.missed_the_header():
+                # The encoder emits its header once, at start. If it started
+                # before this process did, that header is simply gone and no
+                # browser can decode the stream until the encoder is rebuilt.
+                # Toggling the preview off and on from the GCS does exactly that,
+                # so say so instead of leaving the operator on "Connecting…".
+                self.node.get_logger().warn(
+                    'video client connected but no initialisation segment has '
+                    'been seen — the encoder was already running before this '
+                    'relay started. Toggle the debug stream off and on again to '
+                    'make it emit a new one.')
         self.node.get_logger().info(
             f"video client connected from {request.remote} "
-            f"({len(self.video_clients)} total)")
+            f"({len(self.video_clients) + len(self.video_waiting)} total, "
+            f"{len(init)} init chunk(s) replayed)")
         try:
             async for _ in ws:
                 pass          # clients never send on this socket
         finally:
             self.video_clients.discard(ws)
+            self.video_waiting.discard(ws)
             self.node.get_logger().info(
                 f"video client disconnected ({len(self.video_clients)} left)")
         return ws
@@ -626,7 +814,7 @@ class GcsServer:
     async def health_handler(self, _request: web.Request) -> web.Response:
         return web.json_response({
             'clients': len(self.clients),
-            'video_clients': len(self.video_clients),
+            'video_clients': len(self.video_clients) + len(self.video_waiting),
             'pending': self.node.pending_for_send(),
             'mission_state': self.node.snapshot()['mission_state'],
             'frontend': self.dist_dir or 'not built',
@@ -700,7 +888,8 @@ class GcsServer:
         try:
             await asyncio.Event().wait()   # run until cancelled
         finally:
-            for ws in list(self.clients) + list(self.video_clients):
+            for ws in (list(self.clients) + list(self.video_clients)
+                       + list(self.video_waiting)):
                 await ws.close()
             await runner.cleanup()
 

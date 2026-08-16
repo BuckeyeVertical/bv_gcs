@@ -10,6 +10,7 @@ Run with:  python3 -m pytest src/bv_gcs/test/test_video_relay.py
 
 import pytest
 
+from bv_gcs import approval_node
 from bv_gcs.approval_node import (
     MAX_BOX_BYTES,
     MAX_INIT_SEGMENT_BYTES,
@@ -18,6 +19,24 @@ from bv_gcs.approval_node import (
     should_send_video,
     video_backlog_bytes,
 )
+
+
+def test_frontend_dist_resolves_symlink_install(tmp_path, monkeypatch):
+    source_dist = tmp_path / 'source' / 'dist'
+    source_dist.mkdir(parents=True)
+    (source_dist / 'index.html').write_text('<div id="root"></div>')
+
+    install_dist = tmp_path / 'install' / 'web' / 'dist'
+    install_dist.mkdir(parents=True)
+    (install_dist / 'index.html').symlink_to(source_dist / 'index.html')
+
+    monkeypatch.setattr(
+        approval_node,
+        'get_package_share_directory',
+        lambda _package: str(tmp_path / 'install'),
+    )
+
+    assert approval_node.find_frontend_dist() == str(source_dist.resolve())
 
 
 # -- drop-when-busy ------------------------------------------------------------

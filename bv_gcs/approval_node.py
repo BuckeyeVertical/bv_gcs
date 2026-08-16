@@ -239,8 +239,9 @@ def find_frontend_dist() -> str | None:
             os.path.join(os.path.dirname(__file__), '..', 'web', 'dist')))
 
     for path in candidates:
-        if os.path.isfile(os.path.join(path, 'index.html')):
-            return path
+        index_path = os.path.join(path, 'index.html')
+        if os.path.isfile(index_path):
+            return os.path.dirname(os.path.realpath(index_path))
     return None
 
 
@@ -293,6 +294,9 @@ class ApprovalNode(Node):
             String, '/confirmation_window', self._on_confirm_window, window_qos,
             callback_group=self._cb_group)
         self.create_subscription(
+            String, '/sahi_progress', self._on_sahi_progress, window_qos,
+            callback_group=self._cb_group)
+        self.create_subscription(
             String, '/mission_state', self._on_mission_state, reliable,
             callback_group=self._cb_group)
         self.create_subscription(
@@ -328,6 +332,7 @@ class ApprovalNode(Node):
         self._active_initial_age: float = 0.0
         self._mission_state: str | None = None
         self._confirm_window: dict | None = None
+        self._sahi_progress: dict | None = None
         self._drone_fix: dict | None = None
         self._frames: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._last_gps_emit = 0.0
@@ -450,6 +455,20 @@ class ApprovalNode(Node):
             self._confirm_window = window
         self._emit({'type': 'confirm_window', 'window': window})
 
+    def _on_sahi_progress(self, msg: String):
+        """Relay vision_node's current inference batch state."""
+        try:
+            progress = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(progress, dict):
+            return
+        with self._lock:
+            if progress == self._sahi_progress:
+                return
+            self._sahi_progress = progress
+        self._emit({'type': 'sahi_progress', 'progress': progress})
+
     def _on_gps(self, msg: NavSatFix):
         """Forward the drone position, throttled — MAVROS publishes far faster than
         a constrained link should carry."""
@@ -519,12 +538,14 @@ class ApprovalNode(Node):
             mission_state = self._mission_state
             drone_fix = dict(self._drone_fix) if self._drone_fix else None
             confirm_window = self._confirm_window
+            sahi_progress = self._sahi_progress
         return {
             'type': 'snapshot',
             'pending': self.pending_for_send(),
             'mission_state': mission_state,
             'drone_fix': drone_fix,
             'confirm_window': confirm_window,
+            'sahi_progress': sahi_progress,
         }
 
     def _emit(self, payload: dict):

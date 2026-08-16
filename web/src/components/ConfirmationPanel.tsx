@@ -10,8 +10,8 @@ import { useGcsStore } from '../store/useGcsStore';
  * `[off][off][off]` on an object you can plainly see in the feed is a detector that
  * is not firing at all. A 1/3-2/3-3/3 counter would hide that distinction.
  *
- * Hits do not have to be consecutive — three anywhere in the window confirm — so
- * the boxes are deliberately not drawn as a sequence that "resets".
+ * Hits do not have to be consecutive, so the boxes are deliberately not drawn as
+ * a sequence that "resets".
  */
 export function ConfirmationPanel() {
   const win = useGcsStore((s) => s.confirmWindow);

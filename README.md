@@ -57,6 +57,7 @@ bounding box instead: smaller payload *and* a legible target.
 | approval → mission | `/detection_decision` | `bv_msgs/DetectionDecision` (service) | Operator verdict. `accepted=false` if the ID is stale. |
 | mission → all | `/mission_state` | `std_msgs/String` | Displayed in the sidebar. |
 | MAVROS → approval | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | Drone position, throttled before broadcast. |
+| vision → approval | `/sahi_progress` | `std_msgs/String` | Current SAHI batch size, state, and duration. |
 
 `approval_node` parameters (`config/approval_params.yaml`):
 

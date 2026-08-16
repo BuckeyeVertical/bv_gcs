@@ -73,9 +73,13 @@ function handleMessage(raw: string) {
       store.setDroneFix(msg.drone_fix);
       store.setActivePending(msg.pending);
       store.setConfirmWindow(msg.confirm_window);
+      store.setSahiProgress(msg.sahi_progress);
       break;
     case 'confirm_window':
       store.setConfirmWindow(msg.window);
+      break;
+    case 'sahi_progress':
+      store.setSahiProgress(msg.progress);
       break;
     case 'pending':
       store.setActivePending(msg.pending);

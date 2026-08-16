@@ -52,6 +52,20 @@ export interface ConfirmWindow {
   classes: ConfirmClass[];
 }
 
+export interface SahiProgress {
+  run_id: number;
+  active: boolean;
+  status: 'running' | 'complete' | 'error';
+  completed: number;
+  total: number;
+  local_slices: number;
+  slice_width: number;
+  slice_height: number;
+  overlap: number;
+  elapsed_sec: number;
+  error?: string;
+}
+
 export type ServerMessage =
   | {
       type: 'snapshot';
@@ -59,6 +73,7 @@ export type ServerMessage =
       mission_state: string | null;
       drone_fix: DroneFix | null;
       confirm_window: ConfirmWindow | null;
+      sahi_progress: SahiProgress | null;
     }
   | { type: 'pending'; pending: PendingDetection | null }
   | { type: 'mission_state'; data: string }
@@ -70,4 +85,5 @@ export type ServerMessage =
       message: string;
     }
   | { type: 'preview_state'; enabled: boolean }
-  | { type: 'confirm_window'; window: ConfirmWindow };
+  | { type: 'confirm_window'; window: ConfirmWindow }
+  | { type: 'sahi_progress'; progress: SahiProgress };

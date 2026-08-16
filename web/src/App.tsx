@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { ConnectionStatus } from './components/ConnectionStatus';
 import { ConfirmationPanel } from './components/ConfirmationPanel';
+import { SahiProgressPanel } from './components/SahiProgressPanel';
 import { MissionStatePanel } from './components/MissionStatePanel';
 import { PendingDetectionPanel } from './components/PendingDetectionPanel';
 import { DetectionImage } from './components/DetectionImage';
@@ -44,6 +45,7 @@ export default function App() {
                         border-r border-bg-border p-3">
         <MissionStatePanel />
         <ConfirmationPanel />
+        <SahiProgressPanel />
         <StreamToggle videoRef={videoRef} />
       </aside>
 

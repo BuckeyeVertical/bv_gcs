@@ -3,6 +3,7 @@ import type {
   DroneFix,
   PendingDetection,
   ConfirmWindow,
+  SahiProgress,
   StreamState,
 } from '../net/types';
 
@@ -26,6 +27,8 @@ interface GcsState {
 
   /** filtering_node's live confirmation window; null until scan starts. */
   confirmWindow: ConfirmWindow | null;
+  /** vision_node's current or most recently completed SAHI batch. */
+  sahiProgress: SahiProgress | null;
   setConnected: (v: boolean) => void;
   setMissionState: (s: string | null) => void;
   setDroneFix: (fix: DroneFix | null) => void;
@@ -35,6 +38,7 @@ interface GcsState {
   setPreviewEnabled: (v: boolean) => void;
   setStreamState: (s: StreamState) => void;
   setConfirmWindow: (w: ConfirmWindow | null) => void;
+  setSahiProgress: (p: SahiProgress | null) => void;
 }
 
 export const useGcsStore = create<GcsState>((set) => ({
@@ -48,6 +52,7 @@ export const useGcsStore = create<GcsState>((set) => ({
   previewEnabled: false,
   streamState: 'off',
   confirmWindow: null,
+  sahiProgress: null,
 
   setConnected: (v) => set({ connected: v }),
   setMissionState: (s) => set({ missionState: s }),
@@ -66,4 +71,5 @@ export const useGcsStore = create<GcsState>((set) => ({
   setPreviewEnabled: (v) => set({ previewEnabled: v }),
   setStreamState: (s) => set({ streamState: s }),
   setConfirmWindow: (w) => set({ confirmWindow: w }),
+  setSahiProgress: (p) => set({ sahiProgress: p }),
 }));

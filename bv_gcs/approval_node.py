@@ -823,7 +823,16 @@ class GcsServer:
         })
 
     async def index_handler(self, _request: web.Request) -> web.FileResponse:
-        return web.FileResponse(os.path.join(self.dist_dir, 'index.html'))
+        # no-cache means "you may keep it, but revalidate before use" — not
+        # no-store. Without it a browser holds index.html indefinitely and keeps
+        # requesting the content-hashed bundle it named when it was cached. That
+        # bundle is almost always still on disk, because colcon copies into the
+        # install space without ever cleaning it, so the stale request succeeds
+        # and a rebuilt frontend silently changes nothing. The hashed assets
+        # themselves stay cacheable forever; that is what the hash is for.
+        return web.FileResponse(
+            os.path.join(self.dist_dir, 'index.html'),
+            headers={'Cache-Control': 'no-cache'})
 
     async def no_frontend_handler(self, _request: web.Request) -> web.Response:
         return web.Response(

@@ -45,6 +45,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 
 from bv_msgs.msg import PendingDetection
 from bv_msgs.srv import DetectionDecision
+from mavros_msgs.srv import SetMode
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, String, UInt8MultiArray
 
@@ -300,6 +301,9 @@ class ApprovalNode(Node):
             String, '/mission_state', self._on_mission_state, reliable,
             callback_group=self._cb_group)
         self.create_subscription(
+            String, '/path_progress', self._on_path_progress, latched,
+            callback_group=self._cb_group)
+        self.create_subscription(
             NavSatFix, '/mavros/global_position/global', self._on_gps, best_effort,
             callback_group=self._cb_group)
 
@@ -323,6 +327,8 @@ class ApprovalNode(Node):
 
         self.decision_client = self.create_client(
             DetectionDecision, '/detection_decision', callback_group=self._cb_group)
+        self.rtl_client = self.create_client(
+            SetMode, '/mavros/set_mode', callback_group=self._cb_group)
 
         # Shared state, read by the asyncio thread when building a snapshot.
         self._active: dict | None = None
@@ -331,6 +337,7 @@ class ApprovalNode(Node):
         # only when we joined a decision already in progress (see _initial_age).
         self._active_initial_age: float = 0.0
         self._mission_state: str | None = None
+        self._path_progress: dict | None = None
         self._confirm_window: dict | None = None
         self._sahi_progress: dict | None = None
         self._drone_fix: dict | None = None
@@ -438,6 +445,20 @@ class ApprovalNode(Node):
             self._mission_state = msg.data
         self._emit({'type': 'mission_state', 'data': msg.data})
 
+    def _on_path_progress(self, msg: String):
+        """Relay mission_node's absolute lap/scan waypoint progress."""
+        try:
+            progress = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(progress, dict):
+            return
+        with self._lock:
+            if progress == self._path_progress:
+                return
+            self._path_progress = progress
+        self._emit({'type': 'path_progress', 'progress': progress})
+
     def _on_confirm_window(self, msg: String):
         """Relay filtering_node's confirmation window to the browser.
 
@@ -536,6 +557,7 @@ class ApprovalNode(Node):
     def snapshot(self) -> dict:
         with self._lock:
             mission_state = self._mission_state
+            path_progress = self._path_progress
             drone_fix = dict(self._drone_fix) if self._drone_fix else None
             confirm_window = self._confirm_window
             sahi_progress = self._sahi_progress
@@ -543,6 +565,7 @@ class ApprovalNode(Node):
             'type': 'snapshot',
             'pending': self.pending_for_send(),
             'mission_state': mission_state,
+            'path_progress': path_progress,
             'drone_fix': drone_fix,
             'confirm_window': confirm_window,
             'sahi_progress': sahi_progress,
@@ -593,6 +616,43 @@ class ApprovalNode(Node):
             return False, f"service error: {exc}"
 
         return bool(response.accepted), str(response.message)
+
+    async def call_return_home(self):
+        """Command PX4 AUTO.RTL directly through MAVROS."""
+        if not self.rtl_client.service_is_ready():
+            return False, "MAVROS is not offering /mavros/set_mode"
+
+        request = SetMode.Request()
+        request.base_mode = 0
+        request.custom_mode = 'AUTO.RTL'
+
+        loop = asyncio.get_running_loop()
+        aio_future = loop.create_future()
+        ros_future = self.rtl_client.call_async(request)
+
+        def _on_done(fut):
+            def _settle():
+                if aio_future.done():
+                    return
+                try:
+                    aio_future.set_result(fut.result())
+                except Exception as exc:  # noqa: BLE001
+                    aio_future.set_exception(exc)
+            loop.call_soon_threadsafe(_settle)
+
+        ros_future.add_done_callback(_on_done)
+
+        try:
+            response = await asyncio.wait_for(
+                aio_future, timeout=DECISION_CALL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return False, "PX4 did not acknowledge RTL"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"RTL service error: {exc}"
+
+        if not response.mode_sent:
+            return False, "PX4 rejected AUTO.RTL"
+        return True, "PX4 accepted AUTO.RTL"
 
 
 class GcsServer:
@@ -713,6 +773,8 @@ class GcsServer:
                     continue
                 if data.get('type') == 'decision':
                     await self._handle_decision(ws, data)
+                elif data.get('type') == 'return_home':
+                    await self._handle_return_home(ws)
                 elif data.get('type') == 'preview':
                     enabled = bool(data.get('enabled'))
                     self.node.set_preview_enabled(enabled)
@@ -795,6 +857,17 @@ class GcsServer:
         await ws.send_str(json.dumps({
             'type': 'decision_ack',
             'detection_id': detection_id,
+            'accepted': accepted,
+            'message': message,
+        }))
+
+    async def _handle_return_home(self, ws: web.WebSocketResponse):
+        self.node.get_logger().warn('operator requested PX4 AUTO.RTL from GCS')
+        accepted, message = await self.node.call_return_home()
+        if not accepted:
+            self.node.get_logger().error(f'RTL command failed: {message}')
+        await ws.send_str(json.dumps({
+            'type': 'return_home_ack',
             'accepted': accepted,
             'message': message,
         }))

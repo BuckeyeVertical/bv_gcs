@@ -3,6 +3,8 @@ import { ConnectionStatus } from './components/ConnectionStatus';
 import { ConfirmationPanel } from './components/ConfirmationPanel';
 import { SahiProgressPanel } from './components/SahiProgressPanel';
 import { MissionStatePanel } from './components/MissionStatePanel';
+import { PathProgressPanel } from './components/PathProgressPanel';
+import { ReturnHomeSlider } from './components/ReturnHomeSlider';
 import { PendingDetectionPanel } from './components/PendingDetectionPanel';
 import { DetectionImage } from './components/DetectionImage';
 import { VideoPanel } from './components/VideoPanel';
@@ -44,6 +46,8 @@ export default function App() {
       <aside className="col-start-1 row-start-2 space-y-3 overflow-y-auto
                         border-r border-bg-border p-3">
         <MissionStatePanel />
+        <PathProgressPanel />
+        <ReturnHomeSlider />
         <ConfirmationPanel />
         <SahiProgressPanel />
         <StreamToggle videoRef={videoRef} />

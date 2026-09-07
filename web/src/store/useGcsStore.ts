@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type {
   DroneFix,
   PendingDetection,
+  PathProgress,
   ConfirmWindow,
   SahiProgress,
   StreamState,
@@ -11,6 +12,7 @@ interface GcsState {
   connected: boolean;
   missionState: string | null;
   droneFix: DroneFix | null;
+  pathProgress: PathProgress | null;
   activePending: PendingDetection | null;
   /**
    * Wall-clock ms when mission_node will auto-approve, or null when there is no
@@ -32,6 +34,7 @@ interface GcsState {
   setConnected: (v: boolean) => void;
   setMissionState: (s: string | null) => void;
   setDroneFix: (fix: DroneFix | null) => void;
+  setPathProgress: (progress: PathProgress | null) => void;
   setActivePending: (p: PendingDetection | null) => void;
   setInFlightDecisionId: (id: string | null) => void;
   setLastMessage: (m: string | null) => void;
@@ -45,6 +48,7 @@ export const useGcsStore = create<GcsState>((set) => ({
   connected: false,
   missionState: null,
   droneFix: null,
+  pathProgress: null,
   activePending: null,
   pendingDeadline: null,
   inFlightDecisionId: null,
@@ -57,6 +61,7 @@ export const useGcsStore = create<GcsState>((set) => ({
   setConnected: (v) => set({ connected: v }),
   setMissionState: (s) => set({ missionState: s }),
   setDroneFix: (fix) => set({ droneFix: fix }),
+  setPathProgress: (progress) => set({ pathProgress: progress }),
   setActivePending: (p) =>
     set({
       activePending: p,

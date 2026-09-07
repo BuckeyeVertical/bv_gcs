@@ -1,5 +1,5 @@
 import { useGcsStore } from '../store/useGcsStore';
-import type { DecisionAck, ServerMessage } from './types';
+import type { DecisionAck, ReturnHomeAck, ServerMessage } from './types';
 
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 5000;
@@ -39,6 +39,11 @@ interface Waiter {
 }
 
 const waiters = new Map<string, Waiter>();
+let returnHomeWaiter: {
+  resolve: (ack: ReturnHomeAck) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+} | null = null;
 
 function settleWaiter(detectionId: string, ack: DecisionAck) {
   const waiter = waiters.get(detectionId);
@@ -53,6 +58,11 @@ function failAllWaiters(reason: string) {
     clearTimeout(waiter.timer);
     waiter.reject(new Error(reason));
     waiters.delete(id);
+  }
+  if (returnHomeWaiter) {
+    clearTimeout(returnHomeWaiter.timer);
+    returnHomeWaiter.reject(new Error(reason));
+    returnHomeWaiter = null;
   }
 }
 
@@ -71,6 +81,7 @@ function handleMessage(raw: string) {
     case 'snapshot':
       store.setMissionState(msg.mission_state);
       store.setDroneFix(msg.drone_fix);
+      store.setPathProgress(msg.path_progress);
       store.setActivePending(msg.pending);
       store.setConfirmWindow(msg.confirm_window);
       store.setSahiProgress(msg.sahi_progress);
@@ -93,11 +104,24 @@ function handleMessage(raw: string) {
         longitude: msg.longitude,
       });
       break;
+    case 'path_progress':
+      store.setPathProgress(msg.progress);
+      break;
     case 'decision_ack':
       settleWaiter(msg.detection_id, {
         accepted: msg.accepted,
         message: msg.message,
       });
+      break;
+    case 'return_home_ack':
+      if (returnHomeWaiter) {
+        clearTimeout(returnHomeWaiter.timer);
+        returnHomeWaiter.resolve({
+          accepted: msg.accepted,
+          message: msg.message,
+        });
+        returnHomeWaiter = null;
+      }
       break;
     case 'preview_state':
       store.setPreviewEnabled(msg.enabled);
@@ -182,5 +206,26 @@ export function sendDecision(
         reason,
       }),
     );
+  });
+}
+
+/** Directly ask MAVROS/PX4 to enter AUTO.RTL. */
+export function requestReturnHome(): Promise<ReturnHomeAck> {
+  return new Promise((resolve, reject) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      reject(new Error('link is down'));
+      return;
+    }
+    if (returnHomeWaiter) {
+      reject(new Error('RTL request is already in progress'));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      returnHomeWaiter = null;
+      reject(new Error('no RTL acknowledgement from PX4'));
+    }, ACK_TIMEOUT_MS);
+    returnHomeWaiter = { resolve, reject, timer };
+    socket.send(JSON.stringify({ type: 'return_home' }));
   });
 }

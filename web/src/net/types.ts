@@ -26,7 +26,24 @@ export interface DroneFix {
   longitude: number;
 }
 
+export interface PathProgress {
+  phase: 'lap' | 'scan';
+  /** Number of absolute path points already reached. */
+  completed: number;
+  /** One-based point currently being approached, or null when complete. */
+  target: number | null;
+  total: number;
+  /** Latitude/longitude endpoints used to interpolate the live GPS position. */
+  segment_start: [number, number] | null;
+  segment_end: [number, number] | null;
+}
+
 export interface DecisionAck {
+  accepted: boolean;
+  message: string;
+}
+
+export interface ReturnHomeAck {
   accepted: boolean;
   message: string;
 }
@@ -72,18 +89,21 @@ export type ServerMessage =
       pending: PendingDetection | null;
       mission_state: string | null;
       drone_fix: DroneFix | null;
+      path_progress: PathProgress | null;
       confirm_window: ConfirmWindow | null;
       sahi_progress: SahiProgress | null;
     }
   | { type: 'pending'; pending: PendingDetection | null }
   | { type: 'mission_state'; data: string }
   | { type: 'drone_fix'; latitude: number; longitude: number }
+  | { type: 'path_progress'; progress: PathProgress }
   | {
       type: 'decision_ack';
       detection_id: string;
       accepted: boolean;
       message: string;
     }
+  | { type: 'return_home_ack'; accepted: boolean; message: string }
   | { type: 'preview_state'; enabled: boolean }
   | { type: 'confirm_window'; window: ConfirmWindow }
   | { type: 'sahi_progress'; progress: SahiProgress };

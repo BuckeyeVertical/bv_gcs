@@ -30,3 +30,20 @@ export function bearingDeg(
     Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
   return (toDeg(Math.atan2(y, x)) + 360) % 360;
 }
+
+/** Fraction of the way from start to end, projected onto the local path line. */
+export function segmentFraction(
+  latitude: number,
+  longitude: number,
+  start: [number, number],
+  end: [number, number],
+): number {
+  const meanLat = toRad((start[0] + end[0]) / 2);
+  const x = toRad(longitude - start[1]) * Math.cos(meanLat) * R_EARTH_M;
+  const y = toRad(latitude - start[0]) * R_EARTH_M;
+  const dx = toRad(end[1] - start[1]) * Math.cos(meanLat) * R_EARTH_M;
+  const dy = toRad(end[0] - start[0]) * R_EARTH_M;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared === 0) return 0;
+  return Math.max(0, Math.min(1, (x * dx + y * dy) / lengthSquared));
+}

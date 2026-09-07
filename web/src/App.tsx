@@ -23,28 +23,33 @@ export default function App() {
   return (
     <div
       className={
-        'grid h-full grid-rows-[44px_1fr] bg-bg-base ' +
+        'grid h-full grid-rows-[72px_1fr] bg-bg-base ' +
         (pending ? 'grid-cols-[260px_1fr_360px]' : 'grid-cols-[260px_1fr]')
       }
     >
       <header className={
-        'row-start-1 flex items-center justify-between border-b ' +
-        'border-bg-border bg-bg-panel px-4 ' +
+        'relative row-start-1 flex items-center justify-center border-b ' +
+        'border-bg-border bg-black px-2 ' +
         (pending ? 'col-span-3' : 'col-span-2')
       }>
-        <div className="flex items-center gap-3">
-          <span className="font-mono text-sm font-bold tracking-[0.3em] text-ink-primary">
-            BV·GCS
-          </span>
-          <span className="font-mono text-[10px] uppercase text-ink-dim">
-            Human-in-the-loop
-          </span>
-        </div>
-        <ConnectionStatus />
+        <img
+          src="/ohio-state-logo.png"
+          alt="The Ohio State University"
+          className="absolute left-2 h-12 w-auto object-contain"
+        />
+        <span className="font-mono text-xs font-bold uppercase tracking-[0.2em] text-ink-primary">
+          Buckeye Vertical
+        </span>
+        <img
+          src="/getsitelogo.jpg"
+          alt="Buckeye Vertical at The Ohio State University"
+          className="absolute right-2 h-16 w-auto object-contain"
+        />
       </header>
 
       <aside className="col-start-1 row-start-2 space-y-3 overflow-y-auto
                         border-r border-bg-border p-3">
+        <ConnectionStatus />
         <MissionStatePanel />
         <PathProgressPanel />
         <ReturnHomeSlider />

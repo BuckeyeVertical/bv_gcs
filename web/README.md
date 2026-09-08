@@ -73,3 +73,24 @@ visible rather than silent.
   itself optimistically could show a decision that never reached the aircraft.
 - **A dropped link clears the pending.** A detection displayed while disconnected isn't
   trustworthy — the drone may have timed out and moved on.
+
+## Local camera recording
+
+Start the debug stream, then click **Record to Mac**. Recording subscribes to the
+existing `/video` WebSocket and saves the incoming fragmented H.264 MP4 data on
+the browser's computer. No `bv_core` changes or drone-side recording are needed.
+The recording contains the transmitted preview quality, without dashboard overlays.
+
+In browsers exposing `showSaveFilePicker` (such as Chrome on localhost or HTTPS),
+choose the destination folder and filename when recording starts. Data is written
+to disk as it arrives. On browsers or HTTP origins without that API, **Stop
+recording** downloads the MP4 using the browser's configured download folder;
+this fallback automatically stops at 256 MB to bound memory use.
+
+Stop recording before closing the tab. Stopping the stream, disconnecting the
+recording socket, or receiving no data for 15 seconds finalizes the recording.
+Incomplete trailing MP4 boxes are discarded. Link loss may leave gaps in the
+received footage; this is not a full-resolution onboard recording. Some players
+may require remuxing streamable fragmented MP4 files for seeking or playback.
+
+Recording unit checks: `node --test test/recording.test.mjs` (from `web/`).

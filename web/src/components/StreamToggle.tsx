@@ -2,6 +2,7 @@ import type { RefObject } from 'react';
 import { setPreview } from '../net/client';
 import { startVideo, stopVideo } from '../net/videoClient';
 import { useGcsStore } from '../store/useGcsStore';
+import { startRecording, stopRecording, useRecording } from '../net/recording';
 import { Button } from './ui/Button';
 
 /**
@@ -14,11 +15,13 @@ export function StreamToggle({ videoRef }: {
   const enabled = useGcsStore((s) => s.previewEnabled);
   const state = useGcsStore((s) => s.streamState);
 
+  const recording = useRecording();
+
   const toggle = () => {
     const next = !enabled;
     setPreview(next);
     if (next && videoRef.current) startVideo(videoRef.current);
-    else stopVideo();
+    else { stopRecording(); stopVideo(); }
   };
 
   return (
@@ -31,6 +34,13 @@ export function StreamToggle({ videoRef }: {
         {enabled ? 'Stop stream' : 'Start stream'}
       </Button>
       <div className="font-mono text-[10px] text-ink-dim">{state}</div>
+      <Button variant={recording.state === 'recording' ? 'reject' : 'ghost'}
+              className="w-full"
+              disabled={recording.state === 'choosing' || recording.state === 'saving' || (recording.state === 'idle' && state !== 'live')}
+              onClick={() => recording.state === 'recording' ? stopRecording() : void startRecording()}>
+        {recording.state === 'recording' ? 'Stop recording' : recording.state === 'saving' ? 'Saving…' : recording.state === 'choosing' ? 'Choose file…' : 'Record to Mac'}
+      </Button>
+      <div role="status" className="break-words font-mono text-[10px] text-ink-dim">{recording.message}</div>
     </section>
   );
 }

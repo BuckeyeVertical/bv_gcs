@@ -51,9 +51,10 @@ npm --prefix "$repo_dir/web" run build
 echo "Copying the frontend bundle to $jetson_host:$remote_dist..."
 rsync --archive --delete "$repo_dir/web/dist/" "$jetson_host:$remote_dist/"
 
-remote_script='set -euo pipefail
+remote_script='set -eo pipefail
 workspace=$1
 source /opt/ros/humble/setup.bash
+set -u
 cd -- "$workspace"
 colcon build'
 printf -v remote_command 'bash -c %q -- %q' \

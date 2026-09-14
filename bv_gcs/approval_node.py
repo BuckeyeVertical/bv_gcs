@@ -246,6 +246,91 @@ def find_frontend_dist() -> str | None:
     return None
 
 
+def default_mosaic_dir() -> str:
+    """Where stitching_node writes its mosaics.
+
+    Mirrors bv_core's package_source_dir() (bv_core/mission_config.py:26) rather
+    than importing it: bv_core pulls in OpenCV, and this node deliberately stays
+    at ~40 MB RSS on the aircraft. The path is only a default — a workspace that
+    overrides stitching_node's output_dir must override mosaic_dir to match.
+    """
+    candidates = []
+    try:
+        share_dir = get_package_share_directory('bv_core')
+        candidates.append(os.path.abspath(os.path.join(
+            share_dir, '..', '..', '..', '..', 'src', 'bv_core')))
+    except Exception:
+        pass
+    # Source-tree fallback: bv_gcs/bv_gcs/approval_node.py -> src/bv_core
+    candidates.append(os.path.normpath(os.path.join(
+        os.path.dirname(__file__), '..', '..', 'bv_core')))
+
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, 'package.xml')):
+            return os.path.join(candidate, 'stitching_results')
+    return os.path.join(os.getcwd(), 'stitching_results')
+
+
+# End-of-image markers. A file missing its terminator is still being written.
+_END_MARKERS = {
+    '.jpg': b'\xff\xd9',
+    '.jpeg': b'\xff\xd9',
+    '.png': b'IEND\xaeB`\x82',
+}
+
+
+def is_complete(path: str) -> bool:
+    """True when `path` has been written all the way to its end marker.
+
+    stitching_node writes the mosaic with a plain cv2.imwrite straight to its
+    final name (bv_core/stitching.py:716), so for the length of that write the
+    file exists, carries the newest mtime, and is short. Serving it then hands
+    the operator a truncated map inside a normal 200 — and `curl -C -` treats
+    that short Content-Length as a finished download rather than resuming. So
+    completeness is checked before a file is eligible, not after.
+    """
+    marker = _END_MARKERS.get(os.path.splitext(path)[1].lower())
+    if marker is None:
+        return False
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() < len(marker):
+                return False
+            handle.seek(-len(marker), os.SEEK_END)
+            return handle.read(len(marker)) == marker
+    except OSError:
+        return False
+
+
+def list_mosaics(directory: str) -> list:
+    """Completely-written mosaic files in `directory`, newest first.
+
+    Scanning the directory is the *only* way a filename enters the server:
+    nothing ever joins client input onto a path. A missing or unreadable
+    directory is the normal pre-scan state, not an error, so it yields [].
+
+    Ordering is by mtime, deliberately not by filename: stitching_node stamps
+    names `%m%d_%H%M` with no year (bv_core/stitching.py:564), so a lexical
+    sort would rank December above January and serve last year's map on the
+    first flight of the new year.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    paths = [
+        os.path.join(directory, name) for name in names
+        if name.startswith('mosaic_')
+        and name.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ]
+    paths = [
+        path for path in paths
+        if os.path.isfile(path) and is_complete(path)
+    ]
+    return sorted(paths, key=os.path.getmtime, reverse=True)
+
+
 class ApprovalNode(Node):
     """ROS half of the bridge: tracks the active pending and calls the decision service."""
 
@@ -256,12 +341,15 @@ class ApprovalNode(Node):
         self.declare_parameter('ws_port', 8765)
         self.declare_parameter('gps_broadcast_hz', 1.0)
         self.declare_parameter('frame_cache_size', 8)
+        self.declare_parameter('mosaic_dir', default_mosaic_dir())
 
         self.ws_host = str(self.get_parameter('ws_host').value)
         self.ws_port = int(self.get_parameter('ws_port').value)
         gps_hz = float(self.get_parameter('gps_broadcast_hz').value)
         self.gps_min_interval = 1.0 / gps_hz if gps_hz > 0 else 0.0
         self.frame_cache_size = int(self.get_parameter('frame_cache_size').value)
+        self.mosaic_dir = os.path.realpath(
+            str(self.get_parameter('mosaic_dir').value))
 
         reliable = QoSProfile(depth=1)
         reliable.reliability = ReliabilityPolicy.RELIABLE
@@ -886,13 +974,22 @@ class GcsServer:
             headers={'Cache-Control': 'public, max-age=3600'},
         )
 
-    async def health_handler(self, _request: web.Request) -> web.Response:
+    async def health_handler(self, request: web.Request) -> web.Response:
         return web.json_response({
+            # The address the client actually reached us on. Under `npm run dev`
+            # vite proxies /healthz with changeOrigin, so this reports the drone
+            # rather than the dev server — which is what a curl command pasted
+            # into a terminal needs, since curl gets no proxy. Display only: it
+            # comes from the Host header, so it is never used for a redirect or
+            # any access decision.
+            'base_url': f'{request.scheme}://{request.host}',
             'clients': len(self.clients),
             'video_clients': len(self.video_clients) + len(self.video_waiting),
             'pending': self.node.pending_for_send(),
             'mission_state': self.node.snapshot()['mission_state'],
             'frontend': self.dist_dir or 'not built',
+            'mosaic_dir': self.node.mosaic_dir,
+            'mosaics': len(self._mosaics()),
         })
 
     async def index_handler(self, _request: web.Request) -> web.FileResponse:
@@ -919,6 +1016,56 @@ class GcsServer:
             content_type='text/plain',
         )
 
+    # -- stitched mosaic --------------------------------------------------------
+
+    # The mosaic is the one artifact worth pulling off the aircraft mid-mission,
+    # and it goes over HTTP for the same reasons the crops do (see README): the
+    # control channel stays clear, a dropped transfer retries on its own, and any
+    # device on the Herelink WiFi can fetch it without SSH credentials. aiohttp's
+    # FileResponse serves it with sendfile and honors Range, so `curl -C -`
+    # resumes across a radio dropout — which plain scp cannot do.
+
+    def _mosaics(self) -> list:
+        return list_mosaics(self.node.mosaic_dir)
+
+    def _no_mosaic(self) -> web.Response:
+        # JSON rather than a bare 404 so the frontend can tell "nothing stitched
+        # yet" (the normal pre-scan state) from a server that is actually broken.
+        return web.json_response(
+            {'error': 'no mosaic available', 'mosaic_dir': self.node.mosaic_dir},
+            status=404)
+
+    async def mosaic_latest_handler(self, _request: web.Request) -> web.StreamResponse:
+        mosaics = self._mosaics()
+        if not mosaics:
+            return self._no_mosaic()
+        # no-cache, not no-store: revalidate, because the newest mosaic changes
+        # when a later scan lands under a different filename.
+        return web.FileResponse(mosaics[0], headers={'Cache-Control': 'no-cache'})
+
+    async def mosaic_file_handler(self, request: web.Request) -> web.StreamResponse:
+        requested = request.match_info['name']
+        for path in self._mosaics():
+            if os.path.basename(path) == requested:
+                # Each filename carries its stitch timestamp and is never
+                # rewritten, so it is safe to cache indefinitely.
+                return web.FileResponse(
+                    path, headers={'Cache-Control': 'public, max-age=86400'})
+        return self._no_mosaic()
+
+    async def mosaic_list_handler(self, _request: web.Request) -> web.Response:
+        return web.json_response({
+            'mosaic_dir': self.node.mosaic_dir,
+            'mosaics': [
+                {
+                    'name': os.path.basename(path),
+                    'bytes': os.path.getsize(path),
+                    'mtime': os.path.getmtime(path),
+                }
+                for path in self._mosaics()
+            ],
+        })
+
     # -- lifecycle --------------------------------------------------------------
 
     def build_app(self) -> web.Application:
@@ -927,6 +1074,11 @@ class GcsServer:
         app.router.add_get('/video', self.video_handler)
         app.router.add_get('/frame/{detection_id}', self.frame_handler)
         app.router.add_get('/healthz', self.health_handler)
+        # Registered before add_static('/') below: that mount is a catch-all and
+        # aiohttp resolves routes in registration order.
+        app.router.add_get('/mosaic/latest', self.mosaic_latest_handler)
+        app.router.add_get('/mosaic/list', self.mosaic_list_handler)
+        app.router.add_get('/mosaic/file/{name}', self.mosaic_file_handler)
 
         if self.dist_dir:
             stamp = time.strftime(

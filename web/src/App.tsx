@@ -9,6 +9,7 @@ import { PendingDetectionPanel } from './components/PendingDetectionPanel';
 import { DetectionImage } from './components/DetectionImage';
 import { VideoPanel } from './components/VideoPanel';
 import { StreamToggle } from './components/StreamToggle';
+import { MosaicDownloadPanel } from './components/MosaicDownloadPanel';
 import { useGcsStore } from './store/useGcsStore';
 import { connect } from './net/client';
 
@@ -56,6 +57,7 @@ export default function App() {
         <ConfirmationPanel />
         <SahiProgressPanel />
         <StreamToggle videoRef={videoRef} />
+        <MosaicDownloadPanel />
       </aside>
 
       <main className="col-start-2 row-start-2 min-h-0 p-3">

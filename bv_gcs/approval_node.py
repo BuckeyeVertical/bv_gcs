@@ -31,6 +31,7 @@ stalled pipe. For the same reason video sends drop rather than queue.
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -303,8 +304,17 @@ def is_complete(path: str) -> bool:
         return False
 
 
-def list_mosaics(directory: str) -> list:
-    """Completely-written mosaic files in `directory`, newest first.
+# One stitch run writes up to two mosaics into the same directory: the
+# feature-matched one (`mosaic_<stamp>.jpg`) and the dead-reckoned fallback
+# (`naive_mosaic_<stamp>.jpg`). Both carry the same `<stamp>`, which is what
+# lets them be paired back into a run — see mosaic_entries().
+_MOSAIC_RE = re.compile(
+    r'^(?P<naive>naive_)?mosaic_(?P<run>.+)\.(?:jpg|jpeg|png)$',
+    re.IGNORECASE)
+
+
+def mosaic_entries(directory: str) -> list:
+    """Completely-written mosaics in `directory`, newest first.
 
     Scanning the directory is the *only* way a filename enters the server:
     nothing ever joins client input onto a path. A missing or unreadable
@@ -314,21 +324,54 @@ def list_mosaics(directory: str) -> list:
     names `%m%d_%H%M` with no year (bv_core/stitching.py:564), so a lexical
     sort would rank December above January and serve last year's map on the
     first flight of the new year.
+
+    Each entry carries its `run` stamp so callers can regroup a run's outputs.
+    Pairing by mtime would be wrong: the naive fallback is written *before*
+    phase 1 (stitching.py:662), so a run whose feature stitch fails leaves only
+    a naive mosaic, and the two newest files would then straddle two scans.
     """
     try:
         names = os.listdir(directory)
     except OSError:
         return []
-    paths = [
-        os.path.join(directory, name) for name in names
-        if name.startswith('mosaic_')
-        and name.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ]
-    paths = [
-        path for path in paths
-        if os.path.isfile(path) and is_complete(path)
-    ]
-    return sorted(paths, key=os.path.getmtime, reverse=True)
+
+    entries = []
+    for name in names:
+        match = _MOSAIC_RE.match(name)
+        if not match:
+            continue
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path) or not is_complete(path):
+            continue
+        entries.append({
+            'name': name,
+            'path': path,
+            'bytes': os.path.getsize(path),
+            'mtime': os.path.getmtime(path),
+            'kind': 'naive' if match.group('naive') else 'feature',
+            'run': match.group('run'),
+        })
+    return sorted(entries, key=lambda entry: entry['mtime'], reverse=True)
+
+
+def list_mosaics(directory: str) -> list:
+    """Paths of the completely-written mosaics in `directory`, newest first."""
+    return [entry['path'] for entry in mosaic_entries(directory)]
+
+
+def latest_run(entries: list) -> list:
+    """The newest run's mosaics, feature first.
+
+    A run is every mosaic sharing the newest entry's `run` stamp — normally the
+    feature mosaic and its naive fallback, but one alone when the other was
+    skipped or failed.
+    """
+    if not entries:
+        return []
+    run = entries[0]['run']
+    members = [entry for entry in entries if entry['run'] == run]
+    # Feature first: it is the real product, the naive one is the floor under it.
+    return sorted(members, key=lambda entry: entry['kind'] != 'feature')
 
 
 class ApprovalNode(Node):
@@ -1028,6 +1071,9 @@ class GcsServer:
     def _mosaics(self) -> list:
         return list_mosaics(self.node.mosaic_dir)
 
+    def _entries(self) -> list:
+        return mosaic_entries(self.node.mosaic_dir)
+
     def _no_mosaic(self) -> web.Response:
         # JSON rather than a bare 404 so the frontend can tell "nothing stitched
         # yet" (the normal pre-scan state) from a server that is actually broken.
@@ -1036,12 +1082,18 @@ class GcsServer:
             status=404)
 
     async def mosaic_latest_handler(self, _request: web.Request) -> web.StreamResponse:
-        mosaics = self._mosaics()
-        if not mosaics:
+        run = latest_run(self._entries())
+        if not run:
             return self._no_mosaic()
+        # Within the newest run, not across runs: latest_run() puts the
+        # feature-matched mosaic first and falls back to the naive one when the
+        # feature stitch failed. Picking the newest *feature* mosaic globally
+        # would answer with the previous scan's map in exactly that case.
+        chosen = run[0]
         # no-cache, not no-store: revalidate, because the newest mosaic changes
         # when a later scan lands under a different filename.
-        return web.FileResponse(mosaics[0], headers={'Cache-Control': 'no-cache'})
+        return web.FileResponse(
+            chosen['path'], headers={'Cache-Control': 'no-cache'})
 
     async def mosaic_file_handler(self, request: web.Request) -> web.StreamResponse:
         requested = request.match_info['name']
@@ -1054,16 +1106,17 @@ class GcsServer:
         return self._no_mosaic()
 
     async def mosaic_list_handler(self, _request: web.Request) -> web.Response:
+        entries = self._entries()
+        public = [
+            {key: entry[key] for key in ('name', 'bytes', 'mtime', 'kind', 'run')}
+            for entry in entries
+        ]
         return web.json_response({
             'mosaic_dir': self.node.mosaic_dir,
-            'mosaics': [
-                {
-                    'name': os.path.basename(path),
-                    'bytes': os.path.getsize(path),
-                    'mtime': os.path.getmtime(path),
-                }
-                for path in self._mosaics()
-            ],
+            'mosaics': public,
+            # The newest run's outputs, so a client can fetch a scan's mosaics
+            # as a set without reimplementing the pairing rule.
+            'latest_run': [entry['name'] for entry in latest_run(entries)],
         })
 
     # -- lifecycle --------------------------------------------------------------

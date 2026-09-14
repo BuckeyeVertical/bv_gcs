@@ -1,24 +1,34 @@
-import { useEffect, useRef, useState } from 'react';
-import clsx from 'clsx';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from './ui/Button';
 
-/** Local filename for the pull. `-C -` resumes into whatever this names, so it
- *  has to stay stable between the interrupted attempt and the retry. */
-const OUTPUT = 'mosaic.jpg';
+/** Poll interval while no mosaic exists yet. Stops as soon as one appears, so
+ *  this costs nothing for the rest of the flight. */
+const POLL_MS = 15_000;
+
+interface MosaicInfo {
+  name: string;
+  bytes: number;
+}
+
+/** Newest complete mosaic, or null when the scan has not produced one yet. */
+async function fetchLatest(): Promise<MosaicInfo | null> {
+  try {
+    const response = await fetch('/mosaic/list', { cache: 'no-store' });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { mosaics?: MosaicInfo[] };
+    return body.mosaics?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Where the drone actually is, for a command run outside the browser.
+ * Where the drone actually is, for the terminal command below the button.
  *
- * Not `location.origin`, and not `frameUrl` from net/client.ts: those are right
- * for fetches the *browser* makes, which under `npm run dev` go through vite's
- * proxy. curl gets no proxy, so an origin of localhost:5173 would aim it at the
- * dev server instead of the aircraft. approval_node reports the address it was
- * reached on in /healthz, and vite proxies /healthz with changeOrigin — so this
- * answers with the drone in dev and with itself in production, no build-time
- * branching either way.
- *
- * Falls back to the origin: served from approval_node that is already correct,
- * and it keeps the command on screen when /healthz is unreachable.
+ * Not `location.origin`: under `npm run dev` that is the vite dev server, and
+ * curl gets none of the proxying that makes the browser's own request work.
+ * approval_node reports the address it was reached on, and vite proxies
+ * /healthz with changeOrigin, so this answers with the drone either way.
  */
 async function resolveBase(): Promise<string | null> {
   try {
@@ -31,118 +41,117 @@ async function resolveBase(): Promise<string | null> {
   }
 }
 
-/**
- * Copy without assuming a secure context.
- *
- * `navigator.clipboard` is undefined on an insecure origin, and the ground
- * station is exactly that: plain `http://<drone-ip>:8765` over Herelink WiFi,
- * neither HTTPS nor localhost. So the execCommand path below is not a legacy
- * fallback for old browsers — in the field it is the only path that runs.
- * Returns false when both fail, so the caller can tell the operator to select
- * the text instead of silently doing nothing.
- */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Permission denied or no clipboard — fall through to the textarea.
-  }
-
-  const area = document.createElement('textarea');
-  area.value = text;
-  area.setAttribute('readonly', '');
-  // Fixed and transparent so the copy does not scroll the dashboard.
-  area.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
-  document.body.appendChild(area);
-  area.select();
-  let copied = false;
-  try {
-    copied = document.execCommand('copy');
-  } catch {
-    copied = false;
-  }
-  document.body.removeChild(area);
-  return copied;
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 /**
- * Hands the operator the resumable pull for the stitched map.
+ * Pulls the stitched map off the aircraft.
  *
- * The map is large and the link drops, so the fetch has to survive being cut
- * off. `curl -C -` resumes against `GET /mosaic/latest`, which aiohttp serves
- * with Range support. The command is built from `location.origin` so the drone
- * address is already correct — no IP typed from memory mid-mission.
+ * The button hands `/mosaic/latest` to the browser's download manager rather
+ * than buffering it here: the mosaic is large, and a fetch-to-Blob would hold
+ * the whole thing in the tab's memory before writing a byte. The download
+ * manager streams to disk and, because approval_node serves the file with Range
+ * support, an interrupted download can be resumed from the browser's own
+ * download list.
+ *
+ * The curl command stays on screen underneath because it is still the more
+ * dependable option on a link that drops repeatedly — `curl -C -` resumes from
+ * a terminal without depending on the browser having kept the partial file.
  */
 export function MosaicDownloadPanel() {
+  const [latest, setLatest] = useState<MosaicInfo | null>(null);
+  const [base, setBase] = useState<string | null>(null);
   const [status, setStatus] = useState('');
-  const [base, setBase] = useState(window.location.origin);
-  // Whether the server told us that address, as opposed to us assuming it.
-  const [confirmed, setConfirmed] = useState(false);
-  const commandRef = useRef<HTMLElement>(null);
-  const command = `curl -C - -o ${OUTPUT} ${base}/mosaic/latest`;
+  const linkRef = useRef<HTMLAnchorElement>(null);
 
   useEffect(() => {
-    let cancelled = false;
-    void resolveBase().then((resolved) => {
-      if (cancelled || !resolved) return;
-      setBase(resolved);
-      setConfirmed(true);
-    });
-    return () => { cancelled = true; };
+    void resolveBase().then(setBase);
   }, []);
+
+  // Poll only until the first mosaic shows up. A scan can finish long after the
+  // dashboard was opened, and the operator should not have to reload to notice.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const check = async () => {
+      const found = await fetchLatest();
+      if (cancelled) return;
+      if (found) {
+        setLatest(found);
+        return;
+      }
+      timer = window.setTimeout(() => void check(), POLL_MS);
+    };
+    void check();
+
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
+
+  const download = useCallback(async () => {
+    // Re-check immediately before downloading: a stitch may have completed
+    // since the last poll, and the operator wants the current map.
+    const current = (await fetchLatest()) ?? latest;
+    if (!current) {
+      setStatus('No mosaic yet — nothing has finished stitching.');
+      return;
+    }
+    setLatest(current);
+
+    const link = linkRef.current;
+    if (!link) return;
+    // Same-origin, so the download attribute is honored and the file keeps its
+    // stitch timestamp instead of arriving as "latest".
+    link.href = '/mosaic/latest';
+    link.download = current.name;
+    link.click();
+    setStatus(`Downloading ${current.name} (${formatSize(current.bytes)})`);
+  }, [latest]);
 
   useEffect(() => {
     if (!status) return;
-    const timer = window.setTimeout(() => setStatus(''), 4000);
+    const timer = window.setTimeout(() => setStatus(''), 6000);
     return () => window.clearTimeout(timer);
   }, [status]);
 
-  const onCopy = async () => {
-    if (await copyText(command)) {
-      setStatus('Copied — paste into a terminal');
-      return;
-    }
-    // Last resort: select it so the operator's own Cmd-C still works.
-    const node = commandRef.current;
-    if (node) {
-      const range = document.createRange();
-      range.selectNodeContents(node);
-      const selection = window.getSelection();
-      selection?.removeAllRanges();
-      selection?.addRange(range);
-    }
-    setStatus('Copy blocked — text selected, press Cmd-C');
-  };
+  const command = base
+    ? `curl -C - -o ${latest?.name ?? 'mosaic.jpg'} ${base}/mosaic/latest`
+    : null;
 
   return (
     <section className="border border-bg-border bg-bg-panel p-4 space-y-2">
       <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-ink-dim">
         Stitched map
       </div>
-      <Button variant="ghost" className="w-full" onClick={() => void onCopy()}>
-        Copy curl
+
+      <Button variant="ghost" className="w-full" disabled={!latest}
+              onClick={() => void download()}>
+        {latest ? 'Download map' : 'No map yet'}
       </Button>
-      <code
-        ref={commandRef}
-        className="block select-all break-all font-mono text-[10px] leading-relaxed text-ink-muted"
-      >
-        {command}
-      </code>
-      <div
-        role="status"
-        className={clsx(
-          'font-mono text-[10px]',
-          !status && !confirmed ? 'text-accent-amber' : 'text-ink-dim',
-        )}
-      >
-        {status || (confirmed
-          ? 'Resumes if the link drops — rerun the same command.'
-          : 'Address unconfirmed — approval_node did not report one. Rebuild it '
-            + 'if this is not the drone.')}
+      {/* Click target for the download; never rendered visibly. */}
+      <a ref={linkRef} className="hidden" aria-hidden="true" />
+
+      <div role="status" className="font-mono text-[10px] text-ink-dim">
+        {status || (latest
+          ? `${latest.name} · ${formatSize(latest.bytes)}`
+          : 'Waiting for a scan to finish stitching')}
       </div>
+
+      {command && (
+        <details className="font-mono text-[10px] text-ink-dim">
+          <summary className="cursor-pointer select-none">
+            Resumable pull
+          </summary>
+          <code className="mt-1 block select-all break-all leading-relaxed text-ink-muted">
+            {command}
+          </code>
+        </details>
+      )}
     </section>
   );
 }

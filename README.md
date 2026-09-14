@@ -100,6 +100,19 @@ The `npm run build` step is optional but recommended: it produces `web/dist`, wh
 `setup.py` installs and `approval_node` serves. Skip it and `/` shows a placeholder
 telling you what to do.
 
+After syncing repository commits to the Jetson, build and deploy an updated GCS from
+the development computer with:
+
+```bash
+./scripts/sync_jetson_gcs.sh
+```
+
+The script builds `web/dist` locally (the Jetson does not need npm), copies the bundle
+to `~/bv_ws/src/bv_gcs/web/dist` over the first available Jetson link (USB-C first),
+and runs `colcon build` for the full Jetson workspace. An alternate SSH host or remote
+workspace can be passed as the first or second argument; run the script with `--help`
+for details.
+
 ## Running
 
 ### On the drone

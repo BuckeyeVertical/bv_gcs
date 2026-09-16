@@ -53,6 +53,7 @@ from bv_msgs.srv import DetectionDecision
 from mavros_msgs.srv import SetMode
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, String, UInt8MultiArray
+from std_srvs.srv import Trigger
 
 
 # Mirrors CLASS_NAMES in bv_core. Resolved here so the browser stays dumb and there
@@ -658,6 +659,8 @@ class ApprovalNode(Node):
 
         self.decision_client = self.create_client(
             DetectionDecision, '/detection_decision', callback_group=self._cb_group)
+        self.end_laps_client = self.create_client(
+            Trigger, '/mission/end_laps', callback_group=self._cb_group)
         self.rtl_client = self.create_client(
             SetMode, '/mavros/set_mode', callback_group=self._cb_group)
 
@@ -985,6 +988,42 @@ class ApprovalNode(Node):
             return False, "PX4 rejected AUTO.RTL"
         return True, "PX4 accepted AUTO.RTL"
 
+    async def call_end_laps(self):
+        """Ask the mission runner to finish the lap phase early."""
+        if not self.end_laps_client.service_is_ready():
+            return False, "mission_node is not offering /mission/end_laps"
+
+        request = Trigger.Request()
+
+        loop = asyncio.get_running_loop()
+        aio_future = loop.create_future()
+        try:
+            ros_future = self.end_laps_client.call_async(request)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"End laps service error: {exc}"
+
+        def _on_done(fut):
+            def _settle():
+                if aio_future.done():
+                    return
+                try:
+                    aio_future.set_result(fut.result())
+                except Exception as exc:  # noqa: BLE001
+                    aio_future.set_exception(exc)
+            loop.call_soon_threadsafe(_settle)
+
+        ros_future.add_done_callback(_on_done)
+
+        try:
+            response = await asyncio.wait_for(
+                aio_future, timeout=DECISION_CALL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return False, "mission_node did not acknowledge end laps; check mission state"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"End laps service error: {exc}"
+
+        return bool(response.success), str(response.message)
+
 
 class GcsServer:
     """aiohttp half of the bridge: WebSocket, frame endpoint, and static frontend."""
@@ -1111,6 +1150,8 @@ class GcsServer:
                     continue
                 if data.get('type') == 'decision':
                     await self._handle_decision(ws, data)
+                elif data.get('type') == 'end_laps':
+                    await self._handle_end_laps(ws)
                 elif data.get('type') == 'return_home':
                     await self._handle_return_home(ws)
                 elif data.get('type') == 'preview':
@@ -1195,6 +1236,14 @@ class GcsServer:
         await ws.send_str(json.dumps({
             'type': 'decision_ack',
             'detection_id': detection_id,
+            'accepted': accepted,
+            'message': message,
+        }))
+
+    async def _handle_end_laps(self, ws: web.WebSocketResponse):
+        accepted, message = await self.node.call_end_laps()
+        await ws.send_str(json.dumps({
+            'type': 'end_laps_ack',
             'accepted': accepted,
             'message': message,
         }))

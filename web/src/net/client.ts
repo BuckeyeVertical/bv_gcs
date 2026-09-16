@@ -1,5 +1,5 @@
 import { useGcsStore } from '../store/useGcsStore';
-import type { DecisionAck, ReturnHomeAck, ServerMessage } from './types';
+import type { DecisionAck, EndLapsAck, ReturnHomeAck, ServerMessage } from './types';
 
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 5000;
@@ -39,6 +39,7 @@ interface Waiter {
 }
 
 const waiters = new Map<string, Waiter>();
+let endLapsWaiter: Waiter | null = null;
 let returnHomeWaiter: {
   resolve: (ack: ReturnHomeAck) => void;
   reject: (err: Error) => void;
@@ -58,6 +59,11 @@ function failAllWaiters(reason: string) {
     clearTimeout(waiter.timer);
     waiter.reject(new Error(reason));
     waiters.delete(id);
+  }
+  if (endLapsWaiter) {
+    clearTimeout(endLapsWaiter.timer);
+    endLapsWaiter.reject(new Error(reason));
+    endLapsWaiter = null;
   }
   if (returnHomeWaiter) {
     clearTimeout(returnHomeWaiter.timer);
@@ -112,6 +118,13 @@ function handleMessage(raw: string) {
         accepted: msg.accepted,
         message: msg.message,
       });
+      break;
+    case 'end_laps_ack':
+      if (endLapsWaiter) {
+        clearTimeout(endLapsWaiter.timer);
+        endLapsWaiter.resolve(msg);
+        endLapsWaiter = null;
+      }
       break;
     case 'return_home_ack':
       if (returnHomeWaiter) {
@@ -227,5 +240,25 @@ export function requestReturnHome(): Promise<ReturnHomeAck> {
     }, ACK_TIMEOUT_MS);
     returnHomeWaiter = { resolve, reject, timer };
     socket.send(JSON.stringify({ type: 'return_home' }));
+  });
+}
+
+export function requestEndLaps(): Promise<EndLapsAck> {
+  return new Promise((resolve, reject) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      reject(new Error('link is down'));
+      return;
+    }
+    if (endLapsWaiter) {
+      reject(new Error('End laps request is already in progress'));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      endLapsWaiter = null;
+      reject(new Error('no end laps acknowledgement; check mission state'));
+    }, ACK_TIMEOUT_MS);
+    endLapsWaiter = { resolve, reject, timer };
+    socket.send(JSON.stringify({ type: 'end_laps' }));
   });
 }

@@ -4,6 +4,7 @@ import { ConfirmationPanel } from './components/ConfirmationPanel';
 import { SahiProgressPanel } from './components/SahiProgressPanel';
 import { MissionStatePanel } from './components/MissionStatePanel';
 import { PathProgressPanel } from './components/PathProgressPanel';
+import { EndLapsButton } from './components/EndLapsButton';
 import { ReturnHomeSlider } from './components/ReturnHomeSlider';
 import { PendingDetectionPanel } from './components/PendingDetectionPanel';
 import { DetectionImage } from './components/DetectionImage';
@@ -53,6 +54,7 @@ export default function App() {
         <ConnectionStatus />
         <MissionStatePanel />
         <PathProgressPanel />
+        <EndLapsButton />
         <ReturnHomeSlider />
         <ConfirmationPanel />
         <SahiProgressPanel />

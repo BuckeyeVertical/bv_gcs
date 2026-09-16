@@ -43,6 +43,11 @@ export interface DecisionAck {
   message: string;
 }
 
+export interface EndLapsAck {
+  accepted: boolean;
+  message: string;
+}
+
 export interface ReturnHomeAck {
   accepted: boolean;
   message: string;
@@ -103,6 +108,7 @@ export type ServerMessage =
       accepted: boolean;
       message: string;
     }
+  | { type: 'end_laps_ack'; accepted: boolean; message: string }
   | { type: 'return_home_ack'; accepted: boolean; message: string }
   | { type: 'preview_state'; enabled: boolean }
   | { type: 'confirm_window'; window: ConfirmWindow }

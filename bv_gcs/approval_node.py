@@ -400,11 +400,47 @@ def latest_run(entries: list) -> list:
 
 # vision_node writes one frame per scan capture as row{row}_{column}.jpg
 # (bv_core/vision_node.py:1040), and stitching_node parses the same shape back
-# out (bv_core/stitching.py:120). Everything else that lives in raw_frames/ —
-# backup/, the hidden .work_<stamp>/ a stitch run stages into — is a directory
-# and falls out on the isfile check rather than needing its own rule.
+# out (bv_core/stitching.py:120). Anything else sharing the directory is itself a
+# directory and falls out on the isfile check rather than needing its own rule.
 _FRAME_RE = re.compile(
     r'^row(?P<row>\d+)_(?P<col>\d+)\.(?:jpg|jpeg|png)$', re.IGNORECASE)
+
+
+def latest_backup_run(raw_frames_dir: str) -> tuple:
+    """The newest archived stitch run under `raw_frames/backup/`, as (name, path).
+
+    A successful stitch *moves* its inputs out of raw_frames/ into
+    raw_frames/backup/<stamp>/ (bv_core/stitching.py:802), so the loose directory
+    is empty exactly when there is a map to download beside it. backup/ is where a
+    finished run's frames actually live, and the subdirectory name is the same
+    <stamp> that run's mosaics carry: mosaic_<stamp>.jpg and backup/<stamp>/ come
+    out of the same stitch.
+
+    Ordering is by **mtime, not name**, for the reason mosaic_entries() gives:
+    stitching_node stamps `%m%d_%H%M` with no year, so a lexical sort ranks
+    December above January and would serve last year's frames on the first flight
+    of the new year.
+
+    ('', '') when there is no backup/ yet or nothing in it — the ordinary state
+    before the first successful stitch, not an error.
+    """
+    backup_dir = os.path.join(raw_frames_dir, 'backup')
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return ('', '')
+
+    runs = []
+    for name in names:
+        path = os.path.join(backup_dir, name)
+        if not os.path.isdir(path):
+            continue
+        runs.append((os.path.getmtime(path), name, path))
+    if not runs:
+        return ('', '')
+
+    _, name, path = max(runs)
+    return (name, path)
 
 
 def frame_entries(directory: str) -> list:
@@ -414,11 +450,11 @@ def frame_entries(directory: str) -> list:
     enters the server, and a missing directory is the normal pre-scan state
     rather than an error.
 
-    is_complete() matters more here than it does for the mosaic. vision_node
-    writes these from a worker thread (vision_node.py:1048) *while* the scan is
-    flying, so an operator clicking mid-scan will routinely catch a frame
-    half-written — for the mosaic that is a narrow race, for frames it is the
-    common case.
+    is_complete() still applies even though these are archived frames rather than
+    ones being written live. stitching_node archives them with shutil.move, which
+    is an atomic rename only while source and destination share a filesystem; when
+    they do not it degrades to copy-then-unlink, and a frame caught partway through
+    that copy is exactly the truncated file the marker check exists to reject.
 
     Ordering is by (row, column), not mtime or name: it makes the archive's
     member order deterministic, and a lexical sort would file row2_10 between
@@ -1205,6 +1241,7 @@ class GcsServer:
             'mosaic_dir': self.node.mosaic_dir,
             'mosaics': len(self._mosaics()),
             'raw_frames_dir': self.node.raw_frames_dir,
+            'raw_frames_run': self._frame_run()[0] or None,
             'raw_frames': len(self._frames()),
         })
 
@@ -1296,7 +1333,7 @@ class GcsServer:
 
     # The mosaic is a derived artifact: when a stitch comes out wrong, re-running
     # it on the ground needs the *inputs*, and those used to mean landing and
-    # rsyncing raw_frames/. They come down beside the map now, as one archive
+    # rsyncing the raw frames off. They come down beside the map now, as one archive
     # rather than one download per frame — a scan is 24-36 files, and 36 sequential
     # anchor clicks costs more in operator time and Downloads-folder mess than the
     # per-file resume it would buy. The archive itself still resumes: it is served
@@ -1304,25 +1341,35 @@ class GcsServer:
     # Its URL carries the frame set's fingerprint for that resume to be safe — see
     # frame_token().
     #
-    # Note which frames these are. stitching_node *moves* raw_frames/*.jpg into
-    # raw_frames/backup/<stamp>/ the moment a feature stitch succeeds
-    # (bv_core/stitching.py:802), and vision_node clears the directory at each SCAN
-    # entry (vision_node.py:296). So this directory holds frames during a scan and
-    # after a *failed* stitch — the two cases where re-running the stitch by hand is
-    # what the operator wants — and is empty right after a successful one. Empty is
-    # therefore a normal state here, not an error, and it must not stop the mosaics
-    # from downloading.
+    # Which frames: the newest run under raw_frames/backup/, not the loose files in
+    # raw_frames/ itself. A successful stitch moves its inputs into
+    # backup/<stamp>/ (bv_core/stitching.py:802) and vision_node clears the loose
+    # directory at each SCAN entry (vision_node.py:296), so the loose directory is
+    # empty exactly when there is a map to download beside it. backup/<stamp>/ is
+    # the finished run, and <stamp> is the same one the run's mosaics carry.
+    #
+    # Having none is still normal — before the first successful stitch there is no
+    # backup/ at all — so it must not stop the mosaics from downloading.
+
+    def _frame_run(self) -> tuple:
+        return latest_backup_run(self.node.raw_frames_dir)
 
     def _frames(self) -> list:
-        return frame_entries(self.node.raw_frames_dir)
+        return frame_entries(self._frame_run()[1])
 
     async def raw_frames_list_handler(self, _request: web.Request) -> web.Response:
-        entries = self._frames()
+        run, run_dir = self._frame_run()
+        entries = frame_entries(run_dir)
         # 200 with count 0, deliberately not the 404 the mosaic endpoints answer
         # with: "no frames right now" is the expected state after a successful
         # stitch, and the dashboard has to tell it apart from a broken server.
         return web.json_response({
             'raw_frames_dir': self.node.raw_frames_dir,
+            # Which stitch run these came from. Reported rather than left implicit
+            # so the operator can see the frames and the mosaic beside them carry
+            # the same stamp — and notice when they do not.
+            'run': run or None,
+            'run_dir': run_dir or None,
             'frames': [
                 {key: entry[key] for key in ('name', 'bytes', 'mtime')}
                 for entry in entries
@@ -1340,19 +1387,21 @@ class GcsServer:
 
     async def raw_frames_archive_handler(
             self, request: web.Request) -> web.StreamResponse:
-        entries = self._frames()
+        run, run_dir = self._frame_run()
+        entries = frame_entries(run_dir)
         token = frame_token(entries) if entries else None
         requested = request.match_info['token']
 
         if requested != token:
-            # Either the frames are gone (a stitch landed and moved them to
-            # backup/) or a new scan replaced them. Both are ordinary; say which,
-            # because "the map you asked for finished stitching" and "the aircraft
-            # is busy overwriting these" want different reactions from the operator.
+            # Either nothing has been archived yet, or a newer stitch has since
+            # become the latest run. Both are ordinary; say which, because "no scan
+            # has finished stitching" and "a newer run replaced the one you asked
+            # for" want different reactions from the operator.
             return web.json_response({
-                'error': ('no raw frames available' if token is None
-                          else 'raw frames changed since this link was issued'),
+                'error': ('no archived raw frames available' if token is None
+                          else 'a newer stitch run replaced these frames'),
                 'raw_frames_dir': self.node.raw_frames_dir,
+                'run': run or None,
                 'archive_url': (f'/raw_frames/archive/{token}' if token else None),
             }, status=404)
 

@@ -23,6 +23,9 @@ interface FrameArchive {
   /** Where it lives — fingerprinted, so an interrupted resume cannot straddle
    *  a rebuild. Goes stale on purpose; the poll below reissues it. */
   url: string;
+  /** The stitch run these frames came out of. Shown beside the mosaics, which
+   *  carry the same stamp in their filenames when they came from the same run. */
+  run: string;
 }
 
 /**
@@ -52,13 +55,16 @@ async function fetchLatestRun(): Promise<MosaicInfo[]> {
 }
 
 /**
- * The raw scan frames sitting on the aircraft right now, as one archive.
+ * The newest archived stitch run's raw frames, as one archive.
  *
  * These are the stitcher's *inputs*, which is what re-running a bad stitch on the
- * ground needs. They come and go: stitching_node moves them into backup/ the
- * moment a stitch succeeds, and vision_node clears the directory at each scan. So
- * `null` here is the ordinary post-stitch state, not a failure — the button falls
- * back to maps only rather than reporting an error.
+ * ground needs. The server takes them from `raw_frames/backup/<stamp>/`, where a
+ * successful stitch files its inputs — the same `<stamp>` that run's mosaics
+ * carry — rather than from the loose `raw_frames/`, which that same move leaves
+ * empty exactly when there is a map to download beside it.
+ *
+ * `null` before the first successful stitch, which is ordinary rather than a
+ * failure: the button falls back to maps only instead of reporting an error.
  */
 async function fetchFrames(): Promise<FrameArchive | null> {
   try {
@@ -67,6 +73,7 @@ async function fetchFrames(): Promise<FrameArchive | null> {
     const body = (await response.json()) as {
       count?: number;
       bytes?: number;
+      run?: string | null;
       archive_name?: string;
       archive_url?: string;
     };
@@ -76,6 +83,7 @@ async function fetchFrames(): Promise<FrameArchive | null> {
       bytes: body.bytes ?? 0,
       name: body.archive_name ?? 'images.zip',
       url: body.archive_url,
+      run: body.run ?? '',
     };
   } catch {
     return null;
@@ -122,6 +130,10 @@ function formatSize(bytes: number): string {
  * them. The frames ride as one archive rather than one download per frame: a scan
  * is 24-36 files, and that many sequential clicks costs more than the per-file
  * resume it would buy.
+ *
+ * The frames come from the newest archived run, so in the ordinary case they are
+ * the exact inputs to the map downloading beside them — both carry the same stitch
+ * stamp. The panel prints that stamp rather than assuming it.
  *
  * The curl commands stay on screen underneath because they are still the more
  * dependable option on a link that drops repeatedly — `curl -C -` resumes from a
@@ -248,10 +260,15 @@ export function MosaicDownloadPanel() {
     return 'No map yet';
   })();
 
+  // The frames line names its run so a mismatch is visible rather than silent:
+  // the mosaics above carry their stamp in their filenames, and when the two
+  // disagree the frames are not the ones that produced the map.
   const idle = [
     ...run.map((file) => `${file.name} · ${formatSize(file.bytes)}`),
     ...(frames
-      ? [`${frames.name} · ${frames.count} frames · ${formatSize(frames.bytes)}`]
+      ? [`${frames.name} · ${frames.count} frames`
+         + `${frames.run ? ` · run ${frames.run}` : ''}`
+         + ` · ${formatSize(frames.bytes)}`]
       : []),
   ];
 

@@ -29,11 +29,15 @@ stalled pipe. For the same reason video sends drop rather than queue.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
+import zipfile
 from collections import OrderedDict
 
 import rclpy
@@ -247,13 +251,12 @@ def find_frontend_dist() -> str | None:
     return None
 
 
-def default_mosaic_dir() -> str:
-    """Where stitching_node writes its mosaics.
+def bv_core_source_dir() -> str:
+    """bv_core's source tree, or '' when it cannot be located.
 
     Mirrors bv_core's package_source_dir() (bv_core/mission_config.py:26) rather
     than importing it: bv_core pulls in OpenCV, and this node deliberately stays
-    at ~40 MB RSS on the aircraft. The path is only a default — a workspace that
-    overrides stitching_node's output_dir must override mosaic_dir to match.
+    at ~40 MB RSS on the aircraft.
     """
     candidates = []
     try:
@@ -268,8 +271,27 @@ def default_mosaic_dir() -> str:
 
     for candidate in candidates:
         if os.path.isfile(os.path.join(candidate, 'package.xml')):
-            return os.path.join(candidate, 'stitching_results')
-    return os.path.join(os.getcwd(), 'stitching_results')
+            return candidate
+    return ''
+
+
+def default_mosaic_dir() -> str:
+    """Where stitching_node writes its mosaics.
+
+    The path is only a default — a workspace that overrides stitching_node's
+    output_dir must override mosaic_dir to match.
+    """
+    return os.path.join(bv_core_source_dir() or os.getcwd(), 'stitching_results')
+
+
+def default_raw_frames_dir() -> str:
+    """Where vision_node writes the scan frames stitching_node consumes.
+
+    The counterpart of default_mosaic_dir(): same source tree, the other side of
+    the stitch. A workspace that overrides stitching_node's input_dir
+    (bv_core/stitching.py:41) must override raw_frames_dir to match.
+    """
+    return os.path.join(bv_core_source_dir() or os.getcwd(), 'raw_frames')
 
 
 # End-of-image markers. A file missing its terminator is still being written.
@@ -374,6 +396,145 @@ def latest_run(entries: list) -> list:
     return sorted(members, key=lambda entry: entry['kind'] != 'feature')
 
 
+# -- raw scan frames -----------------------------------------------------------
+
+# vision_node writes one frame per scan capture as row{row}_{column}.jpg
+# (bv_core/vision_node.py:1040), and stitching_node parses the same shape back
+# out (bv_core/stitching.py:120). Everything else that lives in raw_frames/ —
+# backup/, the hidden .work_<stamp>/ a stitch run stages into — is a directory
+# and falls out on the isfile check rather than needing its own rule.
+_FRAME_RE = re.compile(
+    r'^row(?P<row>\d+)_(?P<col>\d+)\.(?:jpg|jpeg|png)$', re.IGNORECASE)
+
+
+def frame_entries(directory: str) -> list:
+    """Completely-written raw frames in `directory`, in row/column order.
+
+    Same contract as mosaic_entries(): the directory scan is the only way a name
+    enters the server, and a missing directory is the normal pre-scan state
+    rather than an error.
+
+    is_complete() matters more here than it does for the mosaic. vision_node
+    writes these from a worker thread (vision_node.py:1048) *while* the scan is
+    flying, so an operator clicking mid-scan will routinely catch a frame
+    half-written — for the mosaic that is a narrow race, for frames it is the
+    common case.
+
+    Ordering is by (row, column), not mtime or name: it makes the archive's
+    member order deterministic, and a lexical sort would file row2_10 between
+    row2_1 and row2_2.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+
+    entries = []
+    for name in names:
+        match = _FRAME_RE.match(name)
+        if not match:
+            continue
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path) or not is_complete(path):
+            continue
+        entries.append({
+            'name': name,
+            'path': path,
+            'bytes': os.path.getsize(path),
+            'mtime': os.path.getmtime(path),
+            'row': int(match.group('row')),
+            'col': int(match.group('col')),
+        })
+    return sorted(entries, key=lambda entry: (entry['row'], entry['col']))
+
+
+def frame_token(entries: list) -> str:
+    """Content address for a frame set — the archive's identity in its URL.
+
+    Name, size and mtime of every frame, not just the name list: a new scan
+    reuses the same row<N>_<M> names, so names alone would call two different
+    sets the same one.
+
+    The archive has to be addressed by its contents for the same reason a mosaic
+    is addressed by its stamped filename, and the reason is resumption. A stable
+    URL over changing bytes cannot be resumed safely: `curl -C -` sends a bare
+    Range header with no validator at all, so the server has nothing to detect
+    staleness with, and aiohttp's FileResponse does not honor the `If-Range` a
+    browser does send — it answers 206 either way. A resume that straddled a
+    rebuild would splice two archives into a file that is corrupt without ever
+    looking corrupt. Put the fingerprint in the path and that resume 404s instead,
+    which is loud, and the panel hands out the current URL on its next poll.
+    """
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(
+            f"{entry['name']}:{entry['bytes']}:{entry['mtime']}\n".encode())
+    return digest.hexdigest()[:12]
+
+
+# Always this name — not stamped per run like the mosaics are. The archive is a
+# working file: the operator unzips it next to the stitcher and re-runs, and a
+# fixed name is what makes the command that does it copy-pasteable. The frames
+# inside still carry their row/column names, and the mosaic downloaded beside it
+# carries the run stamp, so nothing about the run is actually lost. A second
+# download lands as images (1).zip, which is the browser's job, not ours.
+FRAME_ARCHIVE_NAME = 'images.zip'
+
+
+# ZIP stores a DOS timestamp, which has no room for a year before 1980, and
+# ZipInfo raises outright on one. The companion computer boots without an RTC and
+# reads 1970 until something sets the clock, so a scan flown right after power-up
+# can hand us frames stamped in 1969 local time. Clamping loses nothing that
+# matters — the frames' names carry their position, and their real mtimes are in
+# /raw_frames/list — where raising would turn the whole download into a 500.
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def _zip_time(mtime: float) -> tuple:
+    stamp = time.localtime(mtime)
+    if stamp.tm_year < 1980:
+        return _ZIP_EPOCH
+    return tuple(stamp[:6])
+
+
+def build_frame_archive(entries: list, destination: str) -> None:
+    """Write `entries` to `destination` as a zip, atomically.
+
+    ZIP_STORED, not DEFLATE: the members are JPEGs, so compression buys nothing
+    measurable and costs CPU the companion computer is not spare on. Members are
+    copied through a buffer rather than read whole, so this stays flat in memory
+    regardless of how many frames a scan produced.
+
+    Members are written under their bare names: unzipping has to drop row1_1.jpg
+    where the operator is standing, not rebuild the drone's absolute path there.
+
+    Built under a .partial name and renamed into place because the finished file
+    is served with Range support. Without the rename a request arriving mid-build
+    reads a short file inside a normal 200, and `curl -C -` treats that truncated
+    Content-Length as a completed download — the same hazard is_complete() exists
+    to close for the mosaic.
+    """
+    partial = destination + '.partial'
+    try:
+        with zipfile.ZipFile(partial, 'w', zipfile.ZIP_STORED) as archive:
+            for entry in entries:
+                info = zipfile.ZipInfo(
+                    entry['name'], date_time=_zip_time(entry['mtime']))
+                info.compress_type = zipfile.ZIP_STORED
+                with open(entry['path'], 'rb') as source, \
+                        archive.open(info, 'w') as member:
+                    shutil.copyfileobj(source, member)
+        os.replace(partial, destination)
+    except BaseException:
+        # A half-built archive must not survive to be served as a whole one, and
+        # must not sit on the aircraft's disk until the next reboot either.
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        raise
+
+
 class ApprovalNode(Node):
     """ROS half of the bridge: tracks the active pending and calls the decision service."""
 
@@ -385,6 +546,7 @@ class ApprovalNode(Node):
         self.declare_parameter('gps_broadcast_hz', 1.0)
         self.declare_parameter('frame_cache_size', 8)
         self.declare_parameter('mosaic_dir', default_mosaic_dir())
+        self.declare_parameter('raw_frames_dir', default_raw_frames_dir())
 
         self.ws_host = str(self.get_parameter('ws_host').value)
         self.ws_port = int(self.get_parameter('ws_port').value)
@@ -393,6 +555,8 @@ class ApprovalNode(Node):
         self.frame_cache_size = int(self.get_parameter('frame_cache_size').value)
         self.mosaic_dir = os.path.realpath(
             str(self.get_parameter('mosaic_dir').value))
+        self.raw_frames_dir = os.path.realpath(
+            str(self.get_parameter('raw_frames_dir').value))
 
         reliable = QoSProfile(depth=1)
         reliable.reliability = ReliabilityPolicy.RELIABLE
@@ -806,6 +970,13 @@ class GcsServer:
         self.video_init = VideoInitCache()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.dist_dir = find_frontend_dist()
+        # Built raw-frame archive, kept between requests and rebuilt only when the
+        # frame set changes. The lock — one build when two operators click at once,
+        # rather than two competing writes to the same path — is created in run(),
+        # where there is a running loop to bind it to.
+        self.frame_archive_lock: asyncio.Lock | None = None
+        self.frame_archive_token: str | None = None
+        self.frame_archive_path: str | None = None
 
     # -- broadcasting -----------------------------------------------------------
 
@@ -1033,6 +1204,8 @@ class GcsServer:
             'frontend': self.dist_dir or 'not built',
             'mosaic_dir': self.node.mosaic_dir,
             'mosaics': len(self._mosaics()),
+            'raw_frames_dir': self.node.raw_frames_dir,
+            'raw_frames': len(self._frames()),
         })
 
     async def index_handler(self, _request: web.Request) -> web.FileResponse:
@@ -1119,6 +1292,103 @@ class GcsServer:
             'latest_run': [entry['name'] for entry in latest_run(entries)],
         })
 
+    # -- raw scan frames --------------------------------------------------------
+
+    # The mosaic is a derived artifact: when a stitch comes out wrong, re-running
+    # it on the ground needs the *inputs*, and those used to mean landing and
+    # rsyncing raw_frames/. They come down beside the map now, as one archive
+    # rather than one download per frame — a scan is 24-36 files, and 36 sequential
+    # anchor clicks costs more in operator time and Downloads-folder mess than the
+    # per-file resume it would buy. The archive itself still resumes: it is served
+    # from a real file, so FileResponse keeps Range and `curl -C -` works on it.
+    # Its URL carries the frame set's fingerprint for that resume to be safe — see
+    # frame_token().
+    #
+    # Note which frames these are. stitching_node *moves* raw_frames/*.jpg into
+    # raw_frames/backup/<stamp>/ the moment a feature stitch succeeds
+    # (bv_core/stitching.py:802), and vision_node clears the directory at each SCAN
+    # entry (vision_node.py:296). So this directory holds frames during a scan and
+    # after a *failed* stitch — the two cases where re-running the stitch by hand is
+    # what the operator wants — and is empty right after a successful one. Empty is
+    # therefore a normal state here, not an error, and it must not stop the mosaics
+    # from downloading.
+
+    def _frames(self) -> list:
+        return frame_entries(self.node.raw_frames_dir)
+
+    async def raw_frames_list_handler(self, _request: web.Request) -> web.Response:
+        entries = self._frames()
+        # 200 with count 0, deliberately not the 404 the mosaic endpoints answer
+        # with: "no frames right now" is the expected state after a successful
+        # stitch, and the dashboard has to tell it apart from a broken server.
+        return web.json_response({
+            'raw_frames_dir': self.node.raw_frames_dir,
+            'frames': [
+                {key: entry[key] for key in ('name', 'bytes', 'mtime')}
+                for entry in entries
+            ],
+            'count': len(entries),
+            'bytes': sum(entry['bytes'] for entry in entries),
+            # The name the archive saves as, and the URL it lives at. They differ
+            # on purpose: the URL is content-addressed so a resume cannot straddle
+            # a rebuild, the filename is fixed so the command that unzips it is
+            # the same command every time.
+            'archive_name': FRAME_ARCHIVE_NAME,
+            'archive_url': (f'/raw_frames/archive/{frame_token(entries)}'
+                            if entries else None),
+        })
+
+    async def raw_frames_archive_handler(
+            self, request: web.Request) -> web.StreamResponse:
+        entries = self._frames()
+        token = frame_token(entries) if entries else None
+        requested = request.match_info['token']
+
+        if requested != token:
+            # Either the frames are gone (a stitch landed and moved them to
+            # backup/) or a new scan replaced them. Both are ordinary; say which,
+            # because "the map you asked for finished stitching" and "the aircraft
+            # is busy overwriting these" want different reactions from the operator.
+            return web.json_response({
+                'error': ('no raw frames available' if token is None
+                          else 'raw frames changed since this link was issued'),
+                'raw_frames_dir': self.node.raw_frames_dir,
+                'archive_url': (f'/raw_frames/archive/{token}' if token else None),
+            }, status=404)
+
+        async with self.frame_archive_lock:
+            # Re-checked inside the lock: whoever held it may have just built the
+            # archive this request wants, and rebuilding it would be pure waste.
+            if (self.frame_archive_token != token
+                    or not self.frame_archive_path
+                    or not os.path.isfile(self.frame_archive_path)):
+                path = os.path.join(
+                    tempfile.gettempdir(), f'bv_gcs_frames_{token}.zip')
+                # In the executor, not inline: this node's loop also carries the
+                # WebSocket control channel and the video relay, and ~20 MB of
+                # zipping on it would stall the 20 s heartbeat.
+                await asyncio.get_running_loop().run_in_executor(
+                    None, build_frame_archive, entries, path)
+                stale = self.frame_archive_path
+                self.frame_archive_path = path
+                self.frame_archive_token = token
+                # The aircraft's disk is not big enough to keep one of these per
+                # scan. Dropped after the swap, never before, so a request already
+                # streaming the old archive keeps its open handle.
+                if stale and stale != path:
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+            archive_path = self.frame_archive_path
+
+        # Immutable, like a stamped mosaic: this URL only ever serves these bytes,
+        # which is what makes an interrupted download safe to resume.
+        return web.FileResponse(archive_path, headers={
+            'Content-Disposition': f'attachment; filename="{FRAME_ARCHIVE_NAME}"',
+            'Cache-Control': 'public, max-age=86400',
+        })
+
     # -- lifecycle --------------------------------------------------------------
 
     def build_app(self) -> web.Application:
@@ -1132,6 +1402,12 @@ class GcsServer:
         app.router.add_get('/mosaic/latest', self.mosaic_latest_handler)
         app.router.add_get('/mosaic/list', self.mosaic_list_handler)
         app.router.add_get('/mosaic/file/{name}', self.mosaic_file_handler)
+        # /raw_frames rather than /frames: /frame/{id} already serves an approval
+        # crop, and two prefixes one character apart carrying unrelated things is
+        # a trap for whoever reads this next.
+        app.router.add_get('/raw_frames/list', self.raw_frames_list_handler)
+        app.router.add_get('/raw_frames/archive/{token}',
+                           self.raw_frames_archive_handler)
 
         if self.dist_dir:
             stamp = time.strftime(
@@ -1152,6 +1428,7 @@ class GcsServer:
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
+        self.frame_archive_lock = asyncio.Lock()
         self.node.emit = self.emit_threadsafe
         self.node.emit_video = self.emit_video_threadsafe
 

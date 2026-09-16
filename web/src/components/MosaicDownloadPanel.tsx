@@ -54,17 +54,8 @@ async function fetchLatestRun(): Promise<MosaicInfo[]> {
   }
 }
 
-/**
- * The newest archived stitch run's raw frames, as one archive.
- *
- * These are the stitcher's *inputs*, which is what re-running a bad stitch on the
- * ground needs. The server takes them from `raw_frames/backup/<stamp>/`, where a
- * successful stitch files its inputs — the same `<stamp>` that run's mosaics
- * carry — rather than from the loose `raw_frames/`, which that same move leaves
- * empty exactly when there is a map to download beside it.
- *
- * `null` before the first successful stitch, which is ordinary rather than a
- * failure: the button falls back to maps only instead of reporting an error.
+/** Completed images directly in raw_frames/, bundled as one archive.
+ * Returns null when no root frames are available; maps can still download.
  */
 async function fetchFrames(): Promise<FrameArchive | null> {
   try {
@@ -131,9 +122,7 @@ function formatSize(bytes: number): string {
  * is 24-36 files, and that many sequential clicks costs more than the per-file
  * resume it would buy.
  *
- * The frames come from the newest archived run, so in the ordinary case they are
- * the exact inputs to the map downloading beside them — both carry the same stitch
- * stamp. The panel prints that stamp rather than assuming it.
+ * Frames come directly from raw_frames/, excluding backup subfolders.
  *
  * The curl commands stay on screen underneath because they are still the more
  * dependable option on a link that drops repeatedly — `curl -C -` resumes from a

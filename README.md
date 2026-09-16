@@ -82,31 +82,12 @@ in the same click — the `row<N>_<M>.jpg` frames the run was built from, served
 archive at `GET /raw_frames/archive/<token>`. An operator who has to remember a second
 button is an operator who lands without them.
 
-They come from `raw_frames/backup/<stamp>/`, **not** from the loose `raw_frames/`.
-`stitching_node` *moves* its inputs into that subdirectory the moment a stitch succeeds
-(`stitching.py:802`) and `vision_node` clears the loose directory at each `SCAN` entry
-(`vision_node.py:296`), so the loose directory is empty exactly when there is a map to
-download beside it. `backup/<stamp>/` is where a finished run's frames actually live —
-and `<stamp>` is the same stamp that run's mosaics carry, because `stitching_node` names
-both from one timestamp (`stitching.py:639`). The panel serves the **newest** archived
-run, which in the ordinary case is precisely the inputs to the map downloading with it.
-
-"Newest" is by **mtime, not name**, the same rule `/mosaic/latest` follows and for the
-same reason: the stamp is `%m%d_%H%M` with no year, so a lexical sort would rank December
-above January and serve last year's frames on the first flight of the new year.
-
-Having none is normal rather than an error — before the first successful stitch there is
-no `backup/` at all. `/raw_frames/list` answers `200` with `count: 0` instead of the `404`
-the mosaic endpoints use, and the button falls back to downloading the maps alone.
-
-Two cases where the frames are *not* the map's inputs, both visible rather than silent.
-`/raw_frames/list` reports the run stamp and the panel prints it beside the mosaic
-filenames, which carry theirs, so a mismatch can be read off the screen. The first is a
-stitch that **failed**: `_restore_files` puts the frames back in the loose directory and
-no `backup/<stamp>/` is ever created (`stitching.py:848`), so the naive fallback mosaic
-downloads next to the *previous* run's frames. The second is a scan flown but not yet
-stitched — its frames are still loose and not offered at all. In both, `rsync` is still
-the way to get those particular frames.
+Frames come directly from the root of `raw_frames/`. Backup subfolders are
+excluded. Only complete images matching `row<N>_<M>.jpg` (or PNG) are included.
+The root frames are available before stitching and are not tied to a mosaic's
+run stamp. `/raw_frames/list` returns `run: null` and identifies the root in
+`run_dir`. If no frames are available, it returns `count: 0` and the button
+can still download the maps.
 
 The frames ride as one archive rather than one download each, which is the opposite of
 the choice made for the mosaics above. A run is 24-36 files: that many sequential anchor
@@ -188,8 +169,8 @@ on it.
 | `GET /mosaic/latest` | Newest *complete* stitched map, JPEG. Range-capable, so `curl -C -` resumes. |
 | `GET /mosaic/list` | JSON index of mosaics: name, size, mtime, kind, run — plus `latest_run`. |
 | `GET /mosaic/file/<name>` | A specific mosaic by name, as listed by `/mosaic/list`. |
-| `GET /raw_frames/list` | JSON index of the newest archived run's frames, with its `run` stamp. `200` with `count: 0` before the first successful stitch — a normal state, not an error. |
-| `GET /raw_frames/archive/<token>` | That run's frames as `images.zip`. `<token>` fingerprints the frame set — take it from `/raw_frames/list`. Range-capable, so `curl -C -` resumes. |
+| `GET /raw_frames/list` | JSON index of complete images in the root of `raw_frames/`; excludes backups. `200` with `count: 0` when empty. |
+| `GET /raw_frames/archive/<token>` | Root frames as `images.zip`. `<token>` fingerprints the frame set — take it from `/raw_frames/list`. Range-capable, so `curl -C -` resumes. |
 
 ## Setup
 
